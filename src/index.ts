@@ -55,9 +55,12 @@ function validBasicAuth(request: Request, env: Env): boolean {
 function statusFor(error: unknown): number {
   if (errIsNum(error, -6)) return 401;
   if (errIsNum(error, -9)) return 404;
+  if (errIsNum(error, -8)) return 409;
   if (errIsNum(error, 4000023)) return 401;
   if (errIsNum(error, 400141)) return 401;
   if (errIsNum(error, 450016)) return 401;
+  // -5: an upstream HTTP hop failed — that's a gateway problem, not ours.
+  if (errIsNum(error, -5)) return 502;
   return 500;
 }
 

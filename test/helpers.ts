@@ -190,7 +190,13 @@ export class MockTerabox {
 				if (m) {
 					const start = Number(m[1]);
 					const end = m[2] === '' ? bytes.byteLength - 1 : Math.min(Number(m[2]), bytes.byteLength - 1);
-					if (start >= bytes.byteLength || start > end) return new Response(null, { status: 416 });
+					if (start >= bytes.byteLength || start > end) {
+						// RFC 7233: unsatisfiable → 416 with the total size.
+						return new Response(null, {
+							status: 416,
+							headers: { 'Content-Range': `bytes */${bytes.byteLength}` },
+						});
+					}
 					const part = bytes.slice(start, end + 1);
 					return new Response(part, {
 						status: 206,
@@ -201,7 +207,8 @@ export class MockTerabox {
 						},
 					});
 				}
-				return new Response(null, { status: 416 });
+				// Malformed / multi-part Range: the CDN ignores it and sends
+				// the whole entity (RFC 7233 §3.1 allows both behaviours).
 			}
 			return new Response(bytes, {
 				status: 200,
@@ -305,7 +312,6 @@ export class MockTerabox {
 				for (const item of filelist) {
 					const src = (typeof item === 'string' ? item : item.path) || '';
 					const node = this.nodes.get(src);
-					const overwrite = typeof item !== 'string' && item.ondup === 'overwrite';
 					if (opera === 'delete') {
 						if (!node) {
 							info.push({ errno: -9 });
@@ -332,11 +338,14 @@ export class MockTerabox {
 						continue;
 					}
 					const destNode = this.nodes.get(dst);
-					if (destNode && !overwrite) {
-						info.push({ errno: -1 });
+					// Live parity: filemanager move/copy never replaces an
+					// existing target — `ondup` is documented but ignored and
+					// the server answers -8 "The file already exists". A
+					// WebDAV Overwrite: T must delete the target first.
+					if (destNode) {
+						info.push({ errno: -8 });
 						continue;
 					}
-					if (destNode && overwrite) this.removeTree(dst);
 					if (opera === 'copy') {
 						this.cloneTree(src, dst);
 					} else if (opera === 'move' || opera === 'rename') {

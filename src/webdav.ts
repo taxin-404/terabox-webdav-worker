@@ -183,7 +183,103 @@ async function statResource(client: TeraboxClient, absPath: string): Promise<Den
   }
 }
 
-function multistatus(resource: DavResource, children: DavResource[]): Response {
+/** Advisory-lock support advertised in `supportedlock` (gdrive parity). */
+const SUPPORTED_LOCK =
+  '<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/><D:shared/></D:lockscope>' +
+  '<D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>';
+
+/** Live DAV props this server can answer, keyed by local name. */
+const LIVE_PROPS: Record<string, (r: DavResource) => string> = {
+  resourcetype: (r) => `<D:resourcetype>${r.isDir ? '<D:collection/>' : ''}</D:resourcetype>`,
+  getcontentlength: (r) => `<D:getcontentlength>${r.size}</D:getcontentlength>`,
+  getcontenttype: (r) => `<D:getcontenttype>${xmlEscape(r.contentType)}</D:getcontenttype>`,
+  getlastmodified: (r) => `<D:getlastmodified>${rfc1123(r.mtimeMs)}</D:getlastmodified>`,
+  getetag: (r) => `<D:getetag>${xmlEscape(r.etag)}</D:getetag>`,
+  displayname: (r) => `<D:displayname>${xmlEscape(displayNameOf(r))}</D:displayname>`,
+  creationdate: (r) => `<D:creationdate>${new Date(r.mtimeMs).toISOString()}</D:creationdate>`,
+  ishidden: () => '<D:ishidden>0</D:ishidden>',
+  supportedlock: () => SUPPORTED_LOCK,
+  // Advisory locks only: no per-resource lock state exists.
+  lockdiscovery: () => '<D:lockdiscovery/>',
+};
+
+/** Order used for allprop / the names-only view. */
+const ALLPROP_ORDER = [
+  'resourcetype',
+  'getcontentlength',
+  'getcontenttype',
+  'getlastmodified',
+  'getetag',
+  'displayname',
+  'creationdate',
+  'ishidden',
+  'supportedlock',
+  'lockdiscovery',
+];
+
+function displayNameOf(r: DavResource): string {
+  const segments = r.href.split('/').filter(Boolean);
+  const last = segments[segments.length - 1];
+  if (!last) return '/';
+  try {
+    return decodeURIComponent(last);
+  } catch {
+    return last;
+  }
+}
+
+interface PropQuery {
+  kind: 'all' | 'names' | 'list';
+  /** local name → original element markup (404s echo the client's own XML). */
+  requested: Map<string, string>;
+}
+
+/**
+ * Parse a PROPFIND body without an XML parser (Workers have no DOMParser).
+ * Unparseable/empty bodies fall back to allprop, which is always legal.
+ */
+export function parsePropfindBody(xml: string): PropQuery {
+  const all: PropQuery = { kind: 'all', requested: new Map() };
+  const body = xml.trim();
+  if (!body) return all;
+  if (/<(?:[A-Za-z0-9_]+:)?allprop[\s/>]/.test(body)) return all;
+  if (/<(?:[A-Za-z0-9_]+:)?propname[\s/>]/.test(body)) {
+    return { kind: 'names', requested: new Map() };
+  }
+  // First <...prop> element (the tag itself: "propfind"/"propname" fail the
+  // trailing ">" / whitespace requirement and can never match here).
+  const open = body.match(/<(?:[A-Za-z0-9_]+:)?prop(?:\s[^>]*)?>/);
+  if (!open || open.index === undefined) return all;
+  const inner = body.slice(open.index + open[0].length);
+  const close = inner.match(/<\/(?:[A-Za-z0-9_]+:)?prop\s*>/);
+  if (!close || close.index === undefined) return all;
+
+  const fragment = inner.slice(0, close.index);
+  const requested = new Map<string, string>();
+  const openTag = /<([A-Za-z0-9_]+:)?([A-Za-z0-9_-]+)(\s[^>]*)?(\/?)>/g;
+  let match: RegExpExecArray | null;
+  while ((match = openTag.exec(fragment)) !== null) {
+    const local = match[2];
+    if (!local) continue;
+    let original = match[0];
+    if (match[4] !== '/') {
+      // Container element: consume through its close tag so inner tags are
+      // not mistaken for separate requests.
+      const closeRe = new RegExp(`</${match[1] || ''}${local}\\s*>`);
+      const rest = fragment.slice(openTag.lastIndex);
+      const cm = rest.match(closeRe);
+      if (cm && cm.index !== undefined) {
+        original = match[0] + rest.slice(0, cm.index + cm[0].length);
+        openTag.lastIndex += cm.index + cm[0].length;
+      }
+    }
+    if (!requested.has(local)) requested.set(local, original);
+  }
+  if (requested.size === 0) return all;
+  return { kind: 'list', requested };
+}
+
+function multistatus(resource: DavResource, children: DavResource[], query: PropQuery): Response {
   const parts: string[] = [];
   parts.push(`<?xml version="1.0" encoding="utf-8"?>`);
   parts.push(`<D:multistatus xmlns:D="${DAV_NS}">`);
@@ -191,18 +287,46 @@ function multistatus(resource: DavResource, children: DavResource[]): Response {
   const emit = (r: DavResource) => {
     parts.push(`<D:response>`);
     parts.push(`<D:href>${xmlEscape(r.href)}</D:href>`);
-    parts.push(`<D:propstat>`);
-    parts.push(`<D:prop>`);
-    parts.push(
-      `<D:resourcetype>${r.isDir ? '<D:collection/>' : ''}</D:resourcetype>` +
-        `<D:getcontentlength>${r.size}</D:getcontentlength>` +
-        `<D:getcontenttype>${xmlEscape(r.contentType)}</D:getcontenttype>` +
-        `<D:getlastmodified>${rfc1123(r.mtimeMs)}</D:getlastmodified>` +
-        `<D:getetag>${xmlEscape(r.etag)}</D:getetag>`,
-    );
-    parts.push(`</D:prop>`);
-    parts.push(`<D:status>HTTP/1.1 200 OK</D:status>`);
-    parts.push(`</D:propstat>`);
+
+    if (query.kind === 'all') {
+      parts.push(`<D:propstat>`);
+      parts.push(`<D:prop>`);
+      for (const name of ALLPROP_ORDER) parts.push(LIVE_PROPS[name]?.(r) ?? '');
+      parts.push(`</D:prop>`);
+      parts.push(`<D:status>HTTP/1.1 200 OK</D:status>`);
+      parts.push(`</D:propstat>`);
+    } else if (query.kind === 'names') {
+      parts.push(`<D:propstat>`);
+      parts.push(`<D:prop>`);
+      for (const name of ALLPROP_ORDER) parts.push(`<D:${name}/>`);
+      parts.push(`</D:prop>`);
+      parts.push(`<D:status>HTTP/1.1 200 OK</D:status>`);
+      parts.push(`</D:propstat>`);
+    } else {
+      const ok: string[] = [];
+      const missing: string[] = [];
+      for (const [name, original] of query.requested) {
+        const build = LIVE_PROPS[name];
+        if (build) ok.push(build(r));
+        else missing.push(original);
+      }
+      if (ok.length > 0) {
+        parts.push(
+          `<D:propstat><D:prop>${ok.join('')}</D:prop>` +
+            `<D:status>HTTP/1.1 200 OK</D:status></D:propstat>`,
+        );
+      }
+      if (missing.length > 0) {
+        parts.push(
+          `<D:propstat><D:prop>${missing.join('')}</D:prop>` +
+            `<D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>`,
+        );
+      }
+      if (ok.length === 0 && missing.length === 0) {
+        parts.push(`<D:propstat><D:prop/><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>`);
+      }
+    }
+
     parts.push(`</D:response>`);
   };
 
@@ -260,7 +384,8 @@ export async function handleWebDav(
       return new Response(null, {
         status: 204,
         headers: {
-          Allow: 'OPTIONS, PROPFIND, MKCOL, GET, HEAD, PUT, DELETE, COPY, MOVE',
+          Allow:
+            'OPTIONS, PROPFIND, PROPPATCH, MKCOL, GET, HEAD, PUT, DELETE, COPY, MOVE, LOCK, UNLOCK',
           DAV: '1, 2',
           'MS-Author-Via': 'DAV',
         },
@@ -269,8 +394,18 @@ export async function handleWebDav(
     case 'PROPFIND':
       return handlePropfind(request, client, absPath, mount);
 
+    case 'PROPPATCH':
+      return handleProppatch(request, client, absPath, mount);
+
+    case 'LOCK':
+      return handleLock(request, client, absPath, mount);
+
+    case 'UNLOCK':
+      // Advisory locks (gdrive parity): unlock always succeeds.
+      return new Response(null, { status: 204 });
+
     case 'MKCOL':
-      return handleMkcol(client, absPath, mount);
+      return handleMkcol(request, client, absPath, mount);
 
     case 'GET':
     case 'HEAD':
@@ -298,21 +433,22 @@ async function handlePropfind(
   mount: Mount,
 ): Promise<Response> {
   const depth = request.headers.get('Depth') || '1';
+  const query = parsePropfindBody(await request.text());
   const resource = await statResource(client, absPath);
   if (!resource) return errorResponse('Not Found', 404);
 
   const href = encodeHref(mount.href(absPath), resource.isDir);
   if (depth === '0') {
-    return multistatus({ ...resource, href }, []);
+    return multistatus({ ...resource, href }, [], query);
   }
 
   // Depth "1" and anything else (infinity/missing) → children only.
   if (absPath !== '/' && !resource.isDir) {
-    return multistatus({ ...resource, href }, []);
+    return multistatus({ ...resource, href }, [], query);
   }
   if (absPath === '/' && !resource.isDir) {
     // Should not happen: the root is always a collection.
-    return multistatus({ ...resource, href }, []);
+    return multistatus({ ...resource, href }, [], query);
   }
 
   let children: DavResource[] = [];
@@ -329,14 +465,29 @@ async function handlePropfind(
     throw error;
   }
 
-  return multistatus({ ...resource, href, isDir: true }, children);
+  return multistatus({ ...resource, href, isDir: true }, children, query);
 }
 
-async function handleMkcol(client: TeraboxClient, absPath: string, mount: Mount): Promise<Response> {
+async function handleMkcol(
+  request: Request,
+  client: TeraboxClient,
+  absPath: string,
+  mount: Mount,
+): Promise<Response> {
   if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
+  // RFC 4918 §9.3.1: a non-empty MKCOL body must be refused with 415
+  // (litmus checks this), not silently ignored.
+  const body = await request.text();
+  if (body.length > 0) return errorResponse('Unsupported Media Type', 415);
   try {
     const existing = await statResource(client, absPath);
-    if (existing) return errorResponse('Method Not Allowed', 405);
+    if (existing) {
+      return new Response(
+        '<D:error xmlns:D="DAV:"><D:exception>MethodNotAllowed</D:exception>' +
+          '<D:message>The resource you tried to create already exists</D:message></D:error>',
+        { status: 405, headers: { 'Content-Type': 'application/xml; charset=utf-8', Allow: 'GET, HEAD, DELETE, MOVE, COPY' } },
+      );
+    }
     await client.mkdir(absPath);
     return new Response(null, { status: 201 });
   } catch (error) {
@@ -355,14 +506,51 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   }
   if ((item.isdir || 0) > 0) return errorResponse('Method Not Allowed', 405);
 
+  const lastModifiedMs = (item.server_mtime || 0) * 1000;
   const headers = new Headers({
     'Content-Type': contentTypeFor(item.server_filename || ''),
-    'Last-Modified': rfc1123((item.server_mtime || 0) * 1000),
+    'Last-Modified': rfc1123(lastModifiedMs),
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'no-store',
   });
-  if (item.md5) headers.set('ETag', `"${item.md5}"`);
-  const range = request.headers.get('Range');
+  const etag = item.md5 ? `"${item.md5}"` : null;
+  if (etag) headers.set('ETag', etag);
+
+  // Conditional GET: validators answer before a download link is minted.
+  const inm = request.headers.get('If-None-Match');
+  if (inm && etag) {
+    const tags = inm.split(',').map((tag) => tag.trim());
+    if (inm.trim() === '*' || tags.includes(etag) || tags.includes(`W/${etag}`)) {
+      return new Response(null, {
+        status: 304,
+        headers: { ETag: etag, 'Last-Modified': rfc1123(lastModifiedMs), 'Cache-Control': 'no-store' },
+      });
+    }
+  }
+  const ims = request.headers.get('If-Modified-Since');
+  if (!inm && ims) {
+    const since = Date.parse(ims);
+    if (!Number.isNaN(since) && lastModifiedMs <= since) {
+      return new Response(null, {
+        status: 304,
+        headers: {
+          'Last-Modified': rfc1123(lastModifiedMs),
+          ...(etag ? { ETag: etag } : {}),
+          'Cache-Control': 'no-store',
+        },
+      });
+    }
+  }
+
+  let range = request.headers.get('Range');
+  const ifRange = request.headers.get('If-Range');
+  if (range && ifRange) {
+    // RFC 7233 §3.2: a stale If-Range validator means "send it all".
+    const fresh = ifRange.includes('"')
+      ? ifRange === etag
+      : !Number.isNaN(Date.parse(ifRange)) && lastModifiedMs <= Date.parse(ifRange);
+    if (!fresh) range = null;
+  }
 
   let lastError: unknown = new TeraboxError(-5, 'No usable download link');
   /** Try one candidate; resolves the ready-to-stream Response or records why it failed. */
@@ -371,6 +559,15 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
       // Paced, cookie-authenticated stream fetch: retries a jsToken gate once
       // and raises an errno-shaped body as TeraboxError instead of streaming it.
       const upstream = await client.fetchDownload(downloadUrl, range);
+      if (upstream.status === 416) {
+        // Range not satisfiable: pass the CDN's verdict through instead of
+        // burning the remaining ladder phases on ranges it will also refuse.
+        const contentRange = upstream.headers.get('Content-Range');
+        if (contentRange) headers.set('Content-Range', contentRange);
+        const contentLength = upstream.headers.get('Content-Length');
+        if (contentLength) headers.set('Content-Length', contentLength);
+        return new Response(upstream.body, { status: 416, headers });
+      }
       if (!upstream.ok && upstream.status !== 206) {
         lastError = new TeraboxError(-5, `Terabox download http error ${upstream.status}`);
         return undefined;
@@ -428,13 +625,15 @@ async function handlePut(request: Request, client: TeraboxClient, absPath: strin
   // Create missing parents so clients that PUT without MKCOL work.
   await ensureParent(client, absPath);
 
-  let existed = false;
+  let existing: { isDir: boolean } | null = null;
   try {
-    const existing = await statResource(client, absPath);
-    existed = Boolean(existing && !existing.isDir);
+    existing = await statResource(client, absPath);
   } catch {
-    existed = false;
+    existing = null;
   }
+  // PUT onto a collection is a method mismatch (RFC 7231 §6.5.5).
+  if (existing && existing.isDir) return errorResponse('Method Not Allowed', 405);
+  const existed = Boolean(existing);
 
   try {
     await client.upload(absPath, size, Date.now(), bytes, existed ? 3 : 0);
@@ -500,6 +699,15 @@ async function handleMoveCopy(
   const destResource = await statResource(client, destPath);
   if (destResource && !overwrite) return errorResponse('Precondition Failed', 412);
 
+  if (destResource) {
+    // Terabox's filemanager refuses to replace an existing target: `ondup`
+    // is documented but ignored server-side (live answers -8 "The file
+    // already exists"; bclone never sets it either). WebDAV Overwrite: T
+    // therefore clears the target first — if the move then fails, the old
+    // node is recoverable from the recycle bin, never destroyed.
+    await client.fileOperation('delete', [{ path: destPath }]);
+  }
+
   await ensureParent(client, destPath);
 
   const { dir, base } = splitPath(destPath);
@@ -508,11 +716,120 @@ async function handleMoveCopy(
       path: srcPath,
       dest: dir === '/' ? '/' : dir,
       newname: base,
-      ...(destResource && overwrite ? { ondup: 'overwrite' } : {}),
     },
   ]);
 
   return new Response(null, { status: destResource && overwrite ? 204 : 201 });
+}
+
+/**
+ * Advisory LOCK (gdrive parity): acquire, refresh and discovery always
+ * succeed — enforcement would need lock state shared across isolates, which
+ * this stateless worker does not pretend to have. Clients that LOCK a name
+ * before their first PUT get a lock-null-style 201.
+ */
+async function handleLock(
+  request: Request,
+  client: TeraboxClient,
+  absPath: string,
+  mount: Mount,
+): Promise<Response> {
+  if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
+  const body = await request.text();
+  const resource = await statResource(client, absPath);
+
+  // Refresh: the client presents its token in If; hand back the same one.
+  const ifHeader = request.headers.get('If') || '';
+  const reused = ifHeader.match(/<(opaquelocktoken:[^<>\s]+|urn:uuid:[^<>\s]+)>/);
+  const token = reused?.[1] ?? `opaquelocktoken:${crypto.randomUUID()}`;
+
+  const timeout = request.headers.get('Timeout') || '';
+  const secondsText = timeout.match(/Second-(\d+)/i)?.[1];
+  const seconds = secondsText
+    ? Math.min(Math.max(parseInt(secondsText, 10), 1), 604800)
+    : 3600;
+
+  const scopeBlock = body.match(
+    /<(?:[A-Za-z0-9_]+:)?lockscope(?:\s[^>]*)?>([\s\S]*?)<\/(?:[A-Za-z0-9_]+:)?lockscope\s*>/,
+  );
+  const shared = /(?:^|<)[A-Za-z0-9_]*:?shared[\s/>]/.test(scopeBlock?.[1] ?? '');
+  const ownerBlock = body.match(
+    /<(?:[A-Za-z0-9_]+:)?owner(?:\s[^>]*)?>([\s\S]*?)<\/(?:[A-Za-z0-9_]+:)?owner\s*>/,
+  );
+  const owner = ownerBlock?.[1] ?? '';
+  const depth = (request.headers.get('Depth') || '').toLowerCase() === '0' ? '0' : 'Infinity';
+
+  const xml =
+    `<?xml version="1.0" encoding="utf-8"?>` +
+    `<D:prop xmlns:D="${DAV_NS}"><D:lockdiscovery><D:activelock>` +
+    `<D:locktype><D:write/></D:locktype>` +
+    `<D:lockscope>${shared ? '<D:shared/>' : '<D:exclusive/>'}</D:lockscope>` +
+    `<D:depth>${depth}</D:depth>` +
+    (owner ? `<D:owner>${owner}</D:owner>` : '') +
+    `<D:timeout>Second-${seconds}</D:timeout>` +
+    `<D:locktoken><D:href>${xmlEscape(token)}</D:href></D:locktoken>` +
+    `</D:activelock></D:lockdiscovery></D:prop>`;
+
+  return new Response(xml, {
+    status: resource ? 200 : 201,
+    headers: {
+      'Content-Type': 'application/xml; charset=utf-8',
+      'Lock-Token': `<${token}>`,
+      'Cache-Control': 'no-store',
+    },
+  });
+}
+
+/**
+ * PROPPATCH: Terabox has nowhere to persist dead properties. Reply with a
+ * well-formed 207 echoing the requested set/remove as 200 (gdrive parity —
+ * what DAV clients expect from PROPPATCH regardless of class advertised).
+ */
+async function handleProppatch(
+  request: Request,
+  client: TeraboxClient,
+  absPath: string,
+  mount: Mount,
+): Promise<Response> {
+  const body = await request.text();
+  const resource = await statResource(client, absPath);
+  if (!resource) return errorResponse('Not Found', 404);
+
+  const propInner = (tag: 'set' | 'remove'): string | null => {
+    const block = body.match(
+      new RegExp(
+        `<(?:[A-Za-z0-9_]+:)?${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</(?:[A-Za-z0-9_]+:)?${tag}\\s*>`,
+      ),
+    );
+    if (!block) return null;
+    const prop = (block[1] ?? '').match(
+      /<(?:[A-Za-z0-9_]+:)?prop(?:\s[^>]*)?>([\s\S]*?)<\/(?:[A-Za-z0-9_]+:)?prop\s*>/,
+    );
+    return prop?.[1] ?? '';
+  };
+
+  const propstats =
+    [
+      propInner('set'),
+      propInner('remove'),
+    ]
+      .filter((inner): inner is string => inner !== null)
+      .map(
+        (inner) =>
+          `<D:propstat><D:prop>${inner}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>`,
+      )
+      .join('') ||
+    `<D:propstat><D:prop/><D:status>HTTP/1.1 200 OK</D:status></D:propstat>`;
+
+  const href = encodeHref(mount.href(absPath), resource.isDir);
+  const xml =
+    `<?xml version="1.0" encoding="utf-8"?>` +
+    `<D:multistatus xmlns:D="${DAV_NS}"><D:response><D:href>${xmlEscape(href)}</D:href>` +
+    `${propstats}</D:response></D:multistatus>`;
+  return new Response(xml, {
+    status: 207,
+    headers: { 'Content-Type': 'application/xml; charset="utf-8"', 'Cache-Control': 'no-store' },
+  });
 }
 
 /** Recursively create missing parents for absPath (ignoring "already exists"). */

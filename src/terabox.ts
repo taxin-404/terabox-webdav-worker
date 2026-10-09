@@ -695,6 +695,11 @@ export class TeraboxClient {
     }
 
     // Non-2xx: 403 WAF pages and gate JSON with an error status.
+    if (status === 416) {
+      // RFC 7233 unsatisfiable-range verdict: a valid answer to a Range
+      // request, never a gate — hand it straight to the WebDAV layer.
+      return { response };
+    }
     const text = await response.text().catch(() => '');
     const gate = errnoBodyFrom(text);
     const errno = gate ? gate.errno : -5;
@@ -763,13 +768,19 @@ export class TeraboxClient {
       info?: Array<{ errno?: number; path?: string }>;
     }>('/api/filemanager', {
       method: 'POST',
-      query: { opera, async: opera === 'copy' ? '2' : '1', onnest: 'fail' },
+      // async=1 ("adaptive") for every opera — bclone parity. async=2 made
+      // the server hand back a task id whose only query endpoint is
+      // /share/taskquery, which answers nginx 404 for filemanager tasks; the
+      // copy itself had already succeeded by then.
+      query: { opera, async: '1', onnest: 'fail' },
       body,
       raw: true,
     });
 
     if (json.taskid && json.taskid > 0) {
-      await this.pollTask(json.taskid);
+      // Adaptive mode may still report a task id for slow operations; the
+      // result is observable on the next list (bclone reads info and moves
+      // on). There is no filemanager task-query endpoint to poll.
       return;
     }
 
@@ -778,27 +789,6 @@ export class TeraboxClient {
       if (entry.errno !== undefined && entry.errno !== 0) throw es(entry.errno);
     }
     if (infos.length === 0 && json.errno) throw es(json.errno);
-    // -8 (already exists) may legitimately occur for non-task responses.
-  }
-
-  private async pollTask(taskId: number): Promise<void> {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const { json } = await this.request<{
-        errno?: number;
-        status?: string;
-        list?: Array<{ errno?: number }>;
-      }>('/share/taskquery', { query: { taskid: String(taskId) } });
-
-      if (json.status === 'running') {
-        await this.sleep(attempt * 1000);
-        continue;
-      }
-      for (const entry of json.list || []) {
-        if (entry.errno !== undefined && entry.errno !== 0) throw es(entry.errno);
-      }
-      return;
-    }
-    throw es(-5);
   }
 
   // ---------------------------------------------------------------------------

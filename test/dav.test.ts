@@ -377,3 +377,237 @@ describe('MOVE / COPY', () => {
 		expect(tb.find('/docs-copy/sub&dir')).toBeDefined();
 	});
 });
+describe('RFC 4918 conformance', () => {
+	const LOCK_BODY =
+		'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+		'<D:locktype><D:write/></D:locktype><D:owner><D:href>tester</D:href></D:owner></D:lockinfo>';
+
+	it('MKCOL with a body is 415, not a silent ignore', async () => {
+		const res = await request('/with-body', {
+			method: 'MKCOL',
+			headers: { 'Content-Type': 'application/xml' },
+			body: '<D:mkcol xmlns:D="DAV:"><D:set><D:prop><D:displayname>x</D:displayname></D:prop></D:set></D:mkcol>',
+		});
+		expect(res.status).toBe(415);
+		expect(tb.find('/with-body')).toBeUndefined();
+	});
+
+	it('PUT over an existing collection is 405', async () => {
+		await request('/col', { method: 'MKCOL' });
+		const res = await request('/col', { method: 'PUT', body: 'x' });
+		expect(res.status).toBe(405);
+		expect(tb.find('/col')!.isdir).toBe(1);
+	});
+
+	it('passes an unsatisfiable Range through as 416', async () => {
+		const res = await request('/a.txt', { headers: { Range: 'bytes=99999999-100000000' } });
+		expect(res.status).toBe(416);
+		expect(res.headers.get('Content-Range')).toContain('/');
+	});
+
+	it('304s on a matching If-None-Match without a body', async () => {
+		const md5 = tb.find('/a.txt')!.md5;
+		const res = await request('/a.txt', { headers: { 'If-None-Match': `"${md5}"` } });
+		expect(res.status).toBe(304);
+		expect(res.headers.get('ETag')).toBe(`"${md5}"`);
+		expect((await new Response(res.body).arrayBuffer()).byteLength).toBe(0);
+	});
+
+	it('304s on a fresh If-Modified-Since', async () => {
+		const mtime = tb.find('/a.txt')!.server_mtime!;
+		const res = await request('/a.txt', {
+			headers: { 'If-Modified-Since': new Date(mtime * 1000).toUTCString() },
+		});
+		expect(res.status).toBe(304);
+	});
+
+	it('still streams on a mismatched If-None-Match', async () => {
+		const res = await request('/a.txt', { headers: { 'If-None-Match': '"stale"' } });
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('the quick brown fox\n');
+	});
+
+	it('ignores Range when If-Range carries a stale etag (serves 200)', async () => {
+		const res = await request('/a.txt', {
+			headers: { Range: 'bytes=0-2', 'If-Range': '"stale"' },
+		});
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('the quick brown fox\n');
+	});
+
+	it('honours Range when If-Range matches the current etag', async () => {
+		const md5 = tb.find('/a.txt')!.md5;
+		const res = await request('/a.txt', {
+			headers: { Range: 'bytes=0-2', 'If-Range': `"${md5}"` },
+		});
+		expect(res.status).toBe(206);
+		expect(await res.text()).toBe('the');
+	});
+
+	it('PROPFIND answers only the requested props and 404s the rest', async () => {
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body:
+				'<D:propfind xmlns:D="DAV:"><D:prop><D:displayname/><D:getcontentlanguage/>' +
+				'<X:custom xmlns:X="urn:x-example"/></D:prop></D:propfind>',
+		});
+		expect(res.status).toBe(207);
+		const body = await res.text();
+		expect(body).toContain('<D:displayname>a.txt</D:displayname>');
+		expect(body).toContain('HTTP/1.1 404 Not Found');
+		expect(body).toContain('<D:getcontentlanguage/>');
+		expect(body).toContain('<X:custom xmlns:X="urn:x-example"/>');
+		// Not requested → not in any 200 propstat.
+		expect(body).not.toContain('<D:getcontentlength>');
+	});
+
+	it('PROPFIND allprop keeps the full set (plus displayname/supportedlock)', async () => {
+		const res = await request('/a.txt', { method: 'PROPFIND', headers: { Depth: '0' } });
+		const body = await res.text();
+		expect(body).toContain('<D:getcontentlength>');
+		expect(body).toContain('<D:getetag>');
+		expect(body).toContain('<D:displayname>a.txt</D:displayname>');
+		expect(body).toContain('<D:supportedlock>');
+		expect(body).toContain('<D:lockdiscovery/>');
+	});
+
+	it('PROPFIND propname returns names with empty values', async () => {
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0' },
+			body: '<D:propfind xmlns:D="DAV:"><D:propname/></D:propfind>',
+		});
+		expect(res.status).toBe(207);
+		const body = await res.text();
+		expect(body).toContain('<D:getetag/>');
+		expect(body).toContain('<D:displayname/>');
+		expect(body).not.toContain(`<D:getcontentlength>${tb.find('/a.txt')!.size}<`);
+	});
+
+	it('PROPFIND on a missing resource stays 404', async () => {
+		const res = await request('/missing.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0' },
+			body: '<D:propfind xmlns:D="DAV:"><D:prop><D:displayname/></D:prop></D:propfind>',
+		});
+		expect(res.status).toBe(404);
+	});
+
+	it('LOCK returns a lockdiscovery document; UNLOCK answers 204', async () => {
+		const res = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(200);
+		const body = await res.text();
+		expect(body).toContain('<D:activelock>');
+		expect(body).toContain('opaquelocktoken:');
+		expect(body).toContain('<D:timeout>Second-3600</D:timeout>');
+		expect(body).toContain('<D:owner><D:href>tester</D:href></D:owner>');
+		expect(res.headers.get('Lock-Token')).toContain('opaquelocktoken:');
+
+		const unlock = await request('/a.txt', {
+			method: 'UNLOCK',
+			headers: { 'Lock-Token': '<opaquelocktoken:whatever>' },
+		});
+		expect(unlock.status).toBe(204);
+	});
+
+	it('LOCK on an unmapped name succeeds (201) without creating it', async () => {
+		const res = await request('/brand-new.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(201);
+		expect(tb.find('/brand-new.txt')).toBeUndefined();
+	});
+
+	it('LOCK honours Timeout and refreshes the same token via If', async () => {
+		const first = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml', Timeout: 'Second-60' },
+			body: LOCK_BODY,
+		});
+		expect(await first.text()).toContain('<D:timeout>Second-60</D:timeout>');
+		const token = first.headers.get('Lock-Token')!;
+		const refresh = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml', If: `(${token})` },
+			body: LOCK_BODY,
+		});
+		expect(refresh.status).toBe(200);
+		expect(refresh.headers.get('Lock-Token')).toBe(token);
+	});
+
+	it('PROPPATCH returns a 207 multistatus echoing the set props', async () => {
+		const res = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body:
+				'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>' +
+				'<X:foo xmlns:X="urn:x-example">bar</X:foo></D:prop></D:set></D:propertyupdate>',
+		});
+		expect(res.status).toBe(207);
+		const body = await res.text();
+		expect(body).toContain('<D:multistatus');
+		expect(body).toContain('HTTP/1.1 200 OK');
+		expect(body).toContain('<X:foo xmlns:X="urn:x-example">bar</X:foo>');
+		expect(body).toContain('<D:href>/a.txt</D:href>');
+	});
+
+	it('PROPPATCH on a missing resource is 404', async () => {
+		const res = await request('/missing.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: '<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:displayname>x</D:displayname></D:prop></D:set></D:propertyupdate>',
+		});
+		expect(res.status).toBe(404);
+	});
+
+	it('OPTIONS advertises the full method set', async () => {
+		const res = await request('/', { method: 'OPTIONS' });
+		const allow = res.headers.get('Allow')!;
+		for (const method of ['PROPFIND', 'PROPPATCH', 'LOCK', 'UNLOCK', 'COPY', 'MOVE']) {
+			expect(allow).toContain(method);
+		}
+	});
+});
+
+describe('overwrite semantics (server never replaces in place)', () => {
+	it('MOVE Overwrite: T deletes the target first and returns 204', async () => {
+		const res = await request('/dest.txt', {
+			method: 'MOVE',
+			headers: { Destination: ORIGIN + '/a.txt', Overwrite: 'T' },
+		});
+		expect(res.status).toBe(204);
+		expect(new TextDecoder().decode(tb.find('/a.txt')!.content!)).toBe('dest content');
+		expect(tb.find('/dest.txt')).toBeUndefined();
+	});
+
+	it('COPY Overwrite: T replaces the target, keeps the source, returns 204', async () => {
+		const res = await request('/a.txt', {
+			method: 'COPY',
+			headers: { Destination: ORIGIN + '/dest.txt', Overwrite: 'T' },
+		});
+		expect(res.status).toBe(204);
+		expect(new TextDecoder().decode(tb.find('/dest.txt')!.content!)).toBe('the quick brown fox\n');
+		expect(tb.find('/a.txt')).toBeDefined();
+	});
+
+	it('MOVE Overwrite: T over a folder replaces the whole tree', async () => {
+		await request('/target-dir', { method: 'MKCOL' });
+		await request('/target-dir/old.txt', { method: 'PUT', body: 'old' });
+		const res = await request('/docs', {
+			method: 'MOVE',
+			headers: { Destination: ORIGIN + '/target-dir', Overwrite: 'T' },
+		});
+		expect(res.status).toBe(204);
+		expect(tb.find('/target-dir')).toBeDefined();
+		expect(tb.find('/target-dir/old.txt')).toBeUndefined();
+		expect(tb.find('/target-dir/b & c.txt')).toBeDefined();
+		expect(tb.find('/docs')).toBeUndefined();
+	});
+});
