@@ -23,7 +23,7 @@ export default defineConfig({
 						miniflare: { ...compat, bindings: davBindings },
 					}),
 				],
-				test: { name: 'dav', include: ['test/dav.test.ts', 'test/md5.test.ts'] },
+				test: { name: 'dav', include: ['test/dav.test.ts', 'test/md5.test.ts', 'test/dlink.test.ts'] },
 			},
 			{
 				plugins: [

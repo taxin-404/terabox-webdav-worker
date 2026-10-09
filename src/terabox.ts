@@ -109,6 +109,34 @@ export function tbPath(path: string): string {
   return path.startsWith('/') ? path : '/' + path;
 }
 
+/**
+ * Mirror the web app's formatDownloadURL: browsers never fetch a dlink on
+ * the <prefix>-d data gateway — they rewrite the host to the main origin
+ * first (dm-d.terabox.com → dm.terabox.com; d.x → www.x when the page is
+ * www). That gateway's /file/ path is what answers 400141 "need verify"
+ * from datacenter IPs, so we follow the exact same rewrite before fetching.
+ * CDN hosts (…-ddata…) and already-main hosts are left untouched.
+ */
+export function browserDlinkUrl(raw: string, pageHostname: string): string {
+  try {
+    const url = new URL(raw);
+    if (!url.pathname.startsWith('/file/')) return raw;
+    const bare = /^d\.(.+)$/.exec(url.hostname);
+    if (bare) {
+      url.hostname = pageHostname.startsWith('www.') ? `www.${bare[1]}` : bare[1]!;
+      return url.toString();
+    }
+    const gateway = /^([a-z0-9]+)-d\.(.+)$/.exec(url.hostname);
+    if (gateway) {
+      url.hostname = `${gateway[1]}.${gateway[2]}`;
+      return url.toString();
+    }
+    return raw;
+  } catch {
+    return raw;
+  }
+}
+
 /** Host of the final hop a download fetch landed on (after redirects). */
 function downloadHost(finalUrl: string, fallback: string): string {
   for (const candidate of [finalUrl, fallback]) {
@@ -508,6 +536,9 @@ export class TeraboxClient {
    * with `dlink@<host>` so live failures name the exact host that gated.
    */
   async fetchDownload(url: string, range?: string | null): Promise<Response> {
+    // Follow the browser: fetch the rewritten main-origin URL, not the gated
+    // <prefix>-d data-gateway host the raw dlink points at.
+    url = browserDlinkUrl(url, new URL(this.baseUrl).hostname);
     let lastError: TeraboxError | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
       let target = url;
