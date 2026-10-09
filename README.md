@@ -22,13 +22,15 @@ cookie.
 
 ## Setup
 
-Create the Worker with three secrets/vars:
+Create the Worker with these secrets/vars:
 
 | Key | Example | Notes |
 | --- | --- | --- |
 | `USERS` | `alice:s3cret,bob:hunter2` | comma/newline separated `user:pass` pairs |
-| `COOKIE` | `ndus=...; lang=en` | Terabox session cookie from your browser |
+| `COOKIE` | `ndus=...; stoken=...; lang=en` | **full** Terabox cookie string from your browser (all cookies — `stoken` matters for uploads) |
 | `TERABOX_DOMAIN` | `https://www.terabox.com` | optional mirror host (default) |
+| `JSTOKEN` | `a1b2c3...` | optional pre-minted token: `window.jsToken` in the terabox.com console (same as Alist/CLI); skips automatic minting |
+| `MIN_GAP_MS` | `400` | optional rate pacing between Terabox calls (default `400`; bclone parity) |
 
 ```sh
 wrangler secret put USERS
@@ -36,7 +38,12 @@ wrangler secret put COOKIE
 npx wrangler deploy
 ```
 
-Prefer secrets over vars: `COOKIE` is genuine credentials.
+Prefer secrets over vars: `COOKIE` and `JSTOKEN` are genuine credentials.
+
+Rate limiting: every outbound Terabox call (API, token mint, download stream)
+is spaced by `MIN_GAP_MS`, retries honour `Retry-After` (capped at 5 s), and
+the jsToken is re-minted at most once per 5 minutes — designed so the account
+never trips Terabox's verification gate.
 
 ## Auto-deploy via the Cloudflare dashboard
 
@@ -52,8 +59,9 @@ The Worker auto-deploys from Git: the dashboard's Git integration watches
    ```sh
    npm ci --legacy-peer-deps
    ```
-6. In the created Worker → **Settings → Variables and Secrets**, add two
-   secrets (`USERS`, `COOKIE`) and optionally the `TERABOX_DOMAIN` variable.
+6. In the created Worker → **Settings → Variables and Secrets**, add the
+   secrets (`USERS`, `COOKIE`, optionally `JSTOKEN`) and variables
+   (`TERABOX_DOMAIN`, `MIN_GAP_MS`).
    Dashboard deploys do not read `.dev.vars` or `wrangler secret put`.
 
 Every `git push origin main` triggers a deploy.

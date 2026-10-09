@@ -92,7 +92,10 @@ const worker: ExportedHandler<Env> = {
       return errorResponse('Unauthorized', 401);
     }
 
-    const client = new TeraboxClient(env.COOKIE, env.TERABOX_DOMAIN);
+    const client = new TeraboxClient(env.COOKIE, env.TERABOX_DOMAIN, {
+      jsToken: env.JSTOKEN,
+      minGapMs: env.MIN_GAP_MS !== undefined ? Number(env.MIN_GAP_MS) : undefined,
+    });
 
     const started = Date.now();
     log('info', `${request.method} ${url.pathname}`);

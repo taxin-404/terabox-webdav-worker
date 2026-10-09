@@ -6,6 +6,12 @@ export interface Env {
   COOKIE?: string;
   // Optional alternate Terabox mirror host (defaults to www.terabox.com).
   TERABOX_DOMAIN?: string;
+  // Optional pre-minted Terabox jsToken: run `window.jsToken` in the browser
+  // console on terabox.com and paste the value (same as Alist/CLI config).
+  // When set, the worker skips automatic token minting.
+  JSTOKEN?: string;
+  // Minimum gap in ms between outbound Terabox calls (default 400).
+  MIN_GAP_MS?: string;
   // Optional per-request log tag.
   LOG_PREFIX?: string;
 }

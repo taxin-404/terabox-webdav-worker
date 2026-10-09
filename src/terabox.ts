@@ -20,6 +20,17 @@ const WEB_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:121.0) G
 
 const RETRY_STATUS = new Set([429, 500, 502, 503, 504, 509]);
 const JS_TOKEN_ERRORS = new Set([4000023, 400141, 450016]);
+/** Minimum gap between outbound Terabox calls (bclone minSleep 400 ms parity). */
+const DEFAULT_MIN_GAP_MS = 400;
+/** Shared pacing state per isolate: slots are assigned in order so even
+ *  concurrent WebDAV requests cannot burst the upstream. */
+let nextUpstreamSlot = 0;
+/** Reused jsToken across WebDAV requests — the root fetch is the call most
+ *  exposed to Terabox's verification gate, so mint at most once per TTL. */
+const JS_TOKEN_CACHE = { token: '', at: 0 };
+const JS_TOKEN_TTL_MS = 5 * 60_000;
+/** Desktop-app UA used when minting the jsToken from the root page. */
+const DESKTOP_APP_USER_AGENT = 'terabox;1.37.0.7;PC;PC-Windows;10.0.22631;WindowsTeraBox';
 
 const TERABOX_ERRORS: Record<number, string> = {
   1: 'System error',
@@ -136,13 +147,18 @@ export class TeraboxClient {
   private uploadHosts: string[] | null = null;
   private isPremium = false;
   private premiumChecked = false;
-  /** Terabox cluster prefix (Url-Domain-Prefix header); drives the
-   *  <prefix>-data.terabox.com host used for upload-host discovery. */
+  /** Terabox cluster prefix (Url-Domain-Prefix header); doubles as the
+   *  fallback origin for upload-host discovery. */
   private domainPrefix = 'jp';
+  /** Pre-minted token from env JSTOKEN (Alist/CLI users paste window.jsToken). */
+  private readonly configuredJsToken: string;
+  private readonly minGapMs: number;
 
-  constructor(cookie: string, domain = DEFAULT_BASE_URL) {
+  constructor(cookie: string, domain = DEFAULT_BASE_URL, opts: { jsToken?: string; minGapMs?: number } = {}) {
     this.cookie = valuedCookie(cookie);
     this.baseUrl = /^https?:\/\//.test(domain) ? domain : 'https://' + domain;
+    this.configuredJsToken = (opts.jsToken || '').trim();
+    this.minGapMs = typeof opts.minGapMs === 'number' && opts.minGapMs >= 0 ? opts.minGapMs : DEFAULT_MIN_GAP_MS;
   }
 
   /** Referer/Cookie pair for streaming Terabox download links. */
@@ -152,6 +168,18 @@ export class TeraboxClient {
 
   cookieForDownload(): string {
     return this.cookie;
+  }
+
+  /**
+   * Reserve the next upstream slot and sleep until it (rate-limit guard).
+   * Every outbound Terabox call — API, jsToken mint, download stream — passes
+   * through here so the account never bursts past bclone's pacing.
+   */
+  async pace(): Promise<void> {
+    const slot = Math.max(Date.now(), nextUpstreamSlot + this.minGapMs);
+    nextUpstreamSlot = slot;
+    const wait = slot - Date.now();
+    if (wait > 0) await this.sleep(wait);
   }
 
   private sleep(ms: number): Promise<void> {
@@ -213,13 +241,18 @@ export class TeraboxClient {
 
     let response: Response;
     try {
+      await this.pace(); // rate-limit guard: no bursts toward Terabox
       response = await fetch(url.toString(), { method: opts.method || 'GET', headers, body });
     } catch (error) {
       throw new TeraboxError(-5, `Terabox network error: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     if (RETRY_STATUS.has(response.status) && attempt < 3) {
-      await this.sleep(attempt * 1000);
+      // bclone pacing: honour Retry-After when present, cap the sleep at 5 s.
+      const retryAfter = Number(response.headers.get('Retry-After'));
+      const delay =
+        Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1000, 5000) : attempt * 1000;
+      await this.sleep(delay);
       return this.request<T>(path, opts, attempt + 1, jsTokenTried);
     }
     // Follow Terabox's cluster hint for the *-data upload-host endpoint.
@@ -292,25 +325,60 @@ export class TeraboxClient {
 
   private async ensureJsToken(force = false): Promise<void> {
     if (this.jsToken && !force) return;
+    // A pre-minted token (env JSTOKEN — the same window.jsToken Alist and
+    // TeraboxUploaderCLI ask their users to paste) skips minting entirely;
+    // only an API rejection (force) triggers a fresh mint.
+    if (this.configuredJsToken && !force) {
+      this.jsToken = this.configuredJsToken;
+      return;
+    }
+    // Reuse the last minted token: the root fetch is the call most exposed
+    // to Terabox's verification gate, so don't repeat it per WebDAV request.
+    if (!force && JS_TOKEN_CACHE.token && Date.now() - JS_TOKEN_CACHE.at < JS_TOKEN_TTL_MS) {
+      this.jsToken = JS_TOKEN_CACHE.token;
+      return;
+    }
     // The session Cookie must be sent: a token minted for an anonymous request
     // (192 hex chars) is rejected by precreate/create with 4000023/400141
     // "need verify". Only a token bound to the account (128 hex chars) works.
-    const response = await fetch(this.baseUrl + '/', {
+    const pages = [`${this.baseUrl}/`, `${this.baseUrl}/main?category=all`];
+    const outcome: string[] = [];
+    for (const page of pages) {
+      const { response, html } = await this.fetchMintPage(page);
+      const token = jsTokenFromHtml(html);
+      const landed = (response.url || page).replace(this.baseUrl, '') || '/';
+      outcome.push(`${landed}=${token ? 'token' : 'none'}`);
+      if (token) {
+        this.jsToken = token;
+        JS_TOKEN_CACHE.token = token;
+        JS_TOKEN_CACHE.at = Date.now();
+        return;
+      }
+    }
+    // Terabox answers pages with a 302 to /simple-verify when the IP or the
+    // session is rate-limited; that page has no jsToken. Probe once without
+    // the Cookie to tell IP gating (anonymous also fails) from session
+    // gating (anonymous still carries a token) — report both outcomes.
+    const anon = await this.fetchMintPage(`${this.baseUrl}/`, false);
+    const anonToken = jsTokenFromHtml(anon.html);
+    const anonLanded = (anon.response.url || `${this.baseUrl}/`).replace(this.baseUrl, '') || '/';
+    outcome.push(`anon:${anonLanded}=${anonToken ? 'token' : 'none'}`);
+    const error = new TeraboxError(400141, 'jsToken unavailable (Terabox verification required)');
+    error.upstream = outcome.join(' ').slice(0, 300);
+    throw error;
+  }
+
+  /** Paced page fetch used for jsToken minting (with or without the session). */
+  private async fetchMintPage(url: string, withCookie = true): Promise<{ response: Response; html: string }> {
+    await this.pace();
+    const response = await fetch(url, {
       headers: {
-        Cookie: this.cookie,
-        Referer: this.baseUrl,
-        'User-Agent': 'terabox;1.37.0.7;PC;PC-Windows;10.0.22631;WindowsTeraBox',
+        ...(withCookie ? { Cookie: this.cookie, Referer: this.baseUrl } : {}),
+        'User-Agent': DESKTOP_APP_USER_AGENT,
       },
       redirect: 'follow',
     });
-    const html = await response.text();
-    const token = jsTokenFromHtml(html);
-    if (!token) {
-      // Terabox answers the root with a 302 to /simple-verify when the IP or
-      // session is rate-limited; that page has no jsToken.
-      throw new TeraboxError(400141, 'jsToken unavailable (Terabox verification required)');
-    }
-    this.jsToken = token;
+    return { response, html: await response.text() };
   }
 
   async checkLogin(): Promise<void> {

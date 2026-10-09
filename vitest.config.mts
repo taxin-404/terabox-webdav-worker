@@ -9,6 +9,8 @@ const davBindings = {
 	USERS: 'test:pass',
 	COOKIE: 'ndus=mock-session-cookie; lang=en',
 	TERABOX_DOMAIN: 'https://mock.terabox.example',
+	// Rate pacing is exercised live; tests must not sleep.
+	MIN_GAP_MS: '0',
 };
 
 export default defineConfig({

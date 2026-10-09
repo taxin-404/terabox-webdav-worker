@@ -294,6 +294,7 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
     upstreamFetchHeaders['Range'] = range;
   }
 
+  await client.pace(); // rate-limit guard before the download stream too
   const upstream = await fetch(downloadUrl, {
     headers: upstreamFetchHeaders,
     redirect: 'follow',
