@@ -1,6 +1,8 @@
-name = "terabox-webdav"
+name = "terabox"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
+workers_dev = true
+preview_urls = true
 
 [observability]
 enabled = true

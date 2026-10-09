@@ -62,7 +62,7 @@ Every `git push origin main` triggers a deploy.
 
 ```sh
 rclone config create terabox webdav \
-  url https://terabox-webdav.<your-subdomain>.workers.dev/ \
+  url https://terabox.taxin-404.workers.dev/ \
   vendor other \
   user alice \
   pass <your-webdav-password>
