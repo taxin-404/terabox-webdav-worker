@@ -28,7 +28,7 @@ Create the Worker with these secrets/vars:
 | --- | --- | --- |
 | `USERS` | `alice:s3cret,bob:hunter2` | comma/newline separated `user:pass` pairs |
 | `COOKIE` | `ndus=...; stoken=...; lang=en` | **full** Terabox cookie string from your browser (all cookies — `stoken` matters for uploads) |
-| `TERABOX_DOMAIN` | `https://www.terabox.com` | optional mirror host (default) |
+| `TERABOX_DOMAIN` | `https://dm.terabox.com` | optional mirror host (default `www.terabox.com`) — **regional deployments matter**: the upload clusters come from this origin's locateupload |
 | `JSTOKEN` | `a1b2c3...` | optional pre-minted token: `window.jsToken` in the terabox.com console (same as Alist/CLI); skips automatic minting |
 | `MIN_GAP_MS` | `400` | optional rate pacing between Terabox calls (default `400`; bclone parity) |
 

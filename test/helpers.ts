@@ -316,12 +316,15 @@ export class MockTerabox {
 			}
 		}
 
-		// Upload-host discovery: d.terabox.com (the browser's endpoint) or the
-		// <prefix>-data.terabox.com origin, bare GET, returns a candidate
-		// server list. The www origin answers 400141 "need verify" — mirrors
-		// live.
+		// Upload-host discovery: the configured base origin answers with the
+		// account's own cluster list (live: dm.terabox.com → dm1/dm2/kul-cdata)
+		// — mirror that here. d.terabox.com / <prefix>-data.terabox.com are
+		// valid fallbacks; everything else answers 400141 "need verify".
 		if (pathname === '/rest/2.0/pcs/file') {
-			const ok = url.hostname === 'd.terabox.com' || url.hostname.endsWith('-data.terabox.com');
+			const ok =
+				url.hostname === new URL(BASE).hostname ||
+				url.hostname === 'd.terabox.com' ||
+				url.hostname.endsWith('-data.terabox.com');
 			if (!ok) return json({ errno: 400141, msg: 'need verify' });
 			const fallback = new URL(UPLOAD_BASE).host;
 			const server = this.locateServers ?? [fallback];

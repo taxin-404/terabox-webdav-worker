@@ -547,15 +547,19 @@ export class TeraboxClient {
     // A host that already accepted an upload in this session is listed first.
     if (this.uploadHost) return [this.uploadHost, ...(this.uploadHosts ?? [])];
     if (this.uploadHosts) return this.uploadHosts;
-    // The web client asks d.terabox.com (bare GET, withCredentials) and gets
-    // a *candidate list* back: server[] plus a host fallback — it probes each
-    // until one accepts the upload (clusters like c-jp/c1-jp/c2-jp can answer
-    // error_code 31045 "user not exists" for the same account). The
-    // <prefix>-data.terabox.com origin serves the same endpoint and is kept
-    // as a fallback (works from datacenter IPs; the www origin answers
-    // 400141 "need verify"). (Official API instead gets upload_domain from
-    // /oauth/tokeninfo — docs/terabox-openapi.md.)
-    const origins = ['https://d.terabox.com', `https://${this.domainPrefix}-data.terabox.com`];
+    // locateupload returns a *candidate list* (server[] plus a host fallback)
+    // and the client walks it until a cluster accepts the upload. The origin
+    // matters more than the IP: regional deployments host different clusters.
+    // Live-verified 2026-10-09: the account behind dm.terabox.com lives on
+    // dm1/dm2/kul-cdata.terabox.com, which d.terabox.com doesn't even know
+    // (it answers the c-jp/c1-jp/c2-jp table → error_code 31045 "user not
+    // exists" on every one). So the configured base origin goes FIRST, then
+    // the browser's d.terabox.com, then <prefix>-data.terabox.com.
+    const origins = [
+      this.baseUrl,
+      'https://d.terabox.com',
+      `https://${this.domainPrefix}-data.terabox.com`,
+    ];
     let lastError: unknown;
     for (const origin of origins) {
       // Browser parity: the XHR runs withCredentials (session Cookie) with

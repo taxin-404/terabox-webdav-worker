@@ -135,13 +135,36 @@ for dashboard deploy, retested):
 - jsToken re-mint ≤ 1 per 5 min — the root page (most gate-exposed call) is
   no longer hit once per WebDAV request.
 
+### Root cause found (2026-10-09, local probes with the user's full cookie)
+
+The account is behind the **`dm.terabox.com` regional deployment**, whose
+locateupload returns a *different* cluster table:
+
+| origin | server[] | chunk upload |
+|---|---|---|
+| `d.terabox.com` (used before) | `c-jp / c1-jp / c2-jp` | **31045 "user not exists"** on all three |
+| `dm.terabox.com` (same-origin) | `dm1-cdata / dm2-cdata / kul-cdata` | **200 + md5 on all three** ✓ |
+
+End-to-end verified from a residential IP with the user's full cookie:
+precreate (`errno 0`) → superfile2 chunk (`{"md5":"ebf5..."}`) → create
+(`fs_id` assigned) → list shows the file. The worker now queries
+**`this.baseUrl` first**, then `d.terabox.com`, then `<prefix>-data`.
+
+Also confirmed live:
+- the old www/`ndus`-only session is fully gated now (`400141` even on GET)
+- `check/login` on `dm` = `errno 0` (`uk REDACTED`); on `www` = `-6`
+- filemetas needs `target` (paths), not `fs_ids`; dlink host = `dm-d.terabox.com`
+  → 302 to `kul-ddata.terabox.com` (region=kul)
+- download speed from the user's PC: ~29 KB/s direct vs 2.5 Mbps via JP VPN
+  (TH→KL peering); the Worker's Cloudflare egress is unaffected by this
+
 ### Status / open work
 
-1. **Awaiting user-provided full cookie + `window.jsToken`** → set
-   `COOKIE` (replace ndus-only) and `JSTOKEN` in the Cloudflare dashboard
-   (Workers → Settings → Variables and Secrets), then retest PUT.
-2. If 31045 survives the full cookie: add browser `logid` param; check
-   whether pcs needs `uid` (fid prefix seen in thumbnails: `<uid>-250528-…`).
+1. **Apply to the Cloudflare dashboard**: `COOKIE` = full string
+   (ndus+stoken+BAIDUID+lang), `TERABOX_DOMAIN` = `https://dm.terabox.com`;
+   then retest PUT + GET live. `JSTOKEN` optional (dm's `/main` serves a
+   session-bound token; the value first pasted by the user was actually
+   `stoken` — re-copy from the console if setting it).
 3. Fix Range/206 passthrough and HEAD `Content-Length` (#3, #4).
 4. Re-run `test/live/webdav-livetest.sh` and update this file.
 
