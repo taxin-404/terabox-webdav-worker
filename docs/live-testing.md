@@ -207,15 +207,46 @@ gate body can never stream out as file content. Mock gained the PCS
 route (302 → `/dl/?via=pcs`), per-flavour gating `gateDl: ['plain' |
 'official' | 'pcs']` and the `gatePcs` knob — 53/53 tests.
 
+### Live verification from Cloudflare (2026-10-09, all green)
+
+| check | result |
+|---|---|
+| GET small txt (pcs ladder phase 1) | **200** + exact content, ~2.5 s (paced) |
+| GET 1 MiB file | **200**, 1 048 576 bytes, **md5 end-to-end match** |
+| Range `bytes=0-8` across the pcs 302 hop | **206** + correct slice |
+| HEAD | 200 + `content-length/etag/last-modified/accept-ranges` |
+| PUT → GET round trip | 201 → 200 |
+| MOVE | 201 + GET of the moved path 200 |
+| DELETE file | **204** (missing repeat → 404) |
+| DELETE 4 test folders (recursive) | 204 ×4, account left clean |
+| PROPFIND Depth 1 | 207, ~0.6 s |
+
+### DELETE contract found (bclone parity, `988f122`)
+
+Live DELETE answered an **empty HTTP 500** from `/api/filemanager` while
+MOVE on the same endpoint worked. bclone's `apiOperation` documents the
+per-opera wire contract:
+
+```
+opera=delete:  filelist ["/path"]                    ← plain path strings
+opera=move:    filelist [{"path":…,"dest":…}]        ← objects
+```
+
+Objects for delete NPE the server into a bare 500 (no body, no errno).
+`fileOperation` now serialises per-opera; the mock mirrors the live
+empty-500 on the object form so every DELETE test locks the contract.
+Deletes go to TeraBox's recycle bin (10-day auto-purge; the web app
+behaves the same — emptying the bin on every WebDAV DELETE would destroy
+files the user trashed deliberately).
+
 ### Status / open work
 
-1. Live-verify GET through the new ladder (pcs route) from Cloudflare:
-   round-trip PUT→GET, Range, HEAD; then mark this file's campaign log
-   with the result.
+1. ~~Live-verify GET through the new ladder~~ — done, see the table above.
 2. Confirm `COOKIE` on the dashboard is a **Secret** (it was originally
    entered as Text; secrets survive deploys, plain-text vars don't —
    `wrangler.toml` `[vars]` now owns `TERABOX_DOMAIN`/`MIN_GAP_MS`).
-3. Fix Range/206 passthrough and HEAD `Content-Length` (#3, #4).
+3. Optional polish: HEAD currently performs a full upstream GET (body
+   discarded); could probe with a 1-byte Range instead.
 4. Re-run `test/live/webdav-livetest.sh` and update this file.
 
 ## Repo map (context for AI sessions)
