@@ -56,6 +56,7 @@ function statusFor(error: unknown): number {
   if (errIsNum(error, -6)) return 401;
   if (errIsNum(error, -9)) return 404;
   if (errIsNum(error, 4000023)) return 401;
+  if (errIsNum(error, 400141)) return 401;
   if (errIsNum(error, 450016)) return 401;
   return 500;
 }
@@ -103,7 +104,7 @@ const worker: ExportedHandler<Env> = {
     } catch (error) {
       if (error instanceof TeraboxError) {
         log('error', `terabox errno ${error.errno}: ${error.message}`, { path: url.pathname });
-        if (error.errno === -6 || error.errno === 4000023 || error.errno === 450016) {
+        if (error.errno === -6 || error.errno === 4000023 || error.errno === 400141 || error.errno === 450016) {
           return errorResponse('Terabox session expired or invalid', 401);
         }
         return errorResponse(error.message, statusFor(error));

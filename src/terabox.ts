@@ -17,7 +17,7 @@ const APP_ID = '250528';
 const CHANNEL = 'dubox';
 
 const RETRY_STATUS = new Set([429, 500, 502, 503, 504, 509]);
-const JS_TOKEN_ERRORS = new Set([4000023, 450016]);
+const JS_TOKEN_ERRORS = new Set([4000023, 400141, 450016]);
 
 const TERABOX_ERRORS: Record<number, string> = {
   1: 'System error',
@@ -48,6 +48,7 @@ const TERABOX_ERRORS: Record<number, string> = {
   '-32': 'Your space is insufficient',
   58: 'File is too large for your plan',
   4000023: 'Invalid session, refreshing token',
+  400141: 'Verification required, refreshing token',
   450016: 'Invalid session, refreshing token',
 };
 
@@ -203,7 +204,7 @@ export class TeraboxClient {
       if (errno !== 0) {
         // Refresh jsToken exactly once, then retry the request.
         if (JS_TOKEN_ERRORS.has(errno) && !jsTokenTried) {
-          await this.ensureJsToken();
+          await this.ensureJsToken(true);
           return this.request<T>(path, opts, attempt, true);
         }
 
@@ -232,13 +233,24 @@ export class TeraboxClient {
 
   private async ensureJsToken(force = false): Promise<void> {
     if (this.jsToken && !force) return;
+    // The session Cookie must be sent: a token minted for an anonymous request
+    // (192 hex chars) is rejected by precreate/create with 4000023/400141
+    // "need verify". Only a token bound to the account (128 hex chars) works.
     const response = await fetch(this.baseUrl + '/', {
-      headers: { 'User-Agent': 'terabox;1.37.0.7;PC;PC-Windows;10.0.22631;WindowsTeraBox' },
+      headers: {
+        Cookie: this.cookie,
+        Referer: this.baseUrl,
+        'User-Agent': 'terabox;1.37.0.7;PC;PC-Windows;10.0.22631;WindowsTeraBox',
+      },
       redirect: 'follow',
     });
     const html = await response.text();
     const token = jsTokenFromHtml(html);
-    if (!token) throw new TeraboxError(-5, 'jsToken not found');
+    if (!token) {
+      // Terabox answers the root with a 302 to /simple-verify when the IP or
+      // session is rate-limited; that page has no jsToken.
+      throw new TeraboxError(400141, 'jsToken unavailable (Terabox verification required)');
+    }
     this.jsToken = token;
   }
 
