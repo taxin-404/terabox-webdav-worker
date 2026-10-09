@@ -213,7 +213,12 @@ export class TeraboxClient {
     const domainPrefix = response.headers.get('Url-Domain-Prefix');
     if (domainPrefix) this.domainPrefix = domainPrefix;
     if (response.status < 200 || response.status > 299) {
-      throw new TeraboxError(-5, `Terabox http error ${response.status}`);
+      // Capture the upstream body: HTTP-level failures (403 WAF pages, rate
+      // limit HTML) carry no JSON errno and would otherwise be opaque.
+      const snippet = (await response.text().catch(() => '')).slice(0, 300);
+      const error = new TeraboxError(-5, `Terabox http error ${response.status}`);
+      if (snippet) error.upstream = snippet;
+      throw error;
     }
 
     const text = await response.text();
@@ -597,7 +602,7 @@ export class TeraboxClient {
 
     const chunkMd5s = chunks.map((chunk) => chunk.md5);
     for (const chunk of chunks) {
-      const uploadedMd5 = await atStep(`chunk${chunk.partSeq}`, () =>
+      const uploadedMd5 = await atStep(`chunk${chunk.partSeq}@${host}`, () =>
         this.uploadChunk(host, absPath, uploadId, chunk.partSeq, chunk.data),
       );
       if (uploadedMd5 !== chunk.md5) {
