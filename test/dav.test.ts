@@ -205,6 +205,22 @@ describe('PUT and MKCOL parents', () => {
 		const res = await request('/', { method: 'PUT', body: 'x' });
 		expect(res.status).toBe(403);
 	});
+
+	it('uploads succeed even when the premium probe fails (bclone parity)', async () => {
+		tb.membershipErrno = -6;
+		const res = await request('/prem-probe.txt', { method: 'PUT', body: 'still works' });
+		expect(res.status).toBe(201);
+		expect(new TextDecoder().decode(tb.find('/prem-probe.txt')!.content)).toBe('still works');
+	});
+
+	it('reports the failing upload stage and errno in the error body', async () => {
+		tb.precreateErrno = 4000023;
+		const res = await request('/stuck.txt', { method: 'PUT', body: 'x' });
+		expect(res.status).toBe(401);
+		const body = (await res.json()) as { error: string; errno?: number; step?: string };
+		expect(body.errno).toBe(4000023);
+		expect(body.step).toBe('precreate');
+	});
 });
 
 describe('DELETE', () => {

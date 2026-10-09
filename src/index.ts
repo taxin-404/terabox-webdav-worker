@@ -103,11 +103,13 @@ const worker: ExportedHandler<Env> = {
       return response;
     } catch (error) {
       if (error instanceof TeraboxError) {
-        log('error', `terabox errno ${error.errno}: ${error.message}`, { path: url.pathname });
+        log('error', `terabox errno ${error.errno}: ${error.message}`, { path: url.pathname, step: error.step });
+        // Additive diagnostics: which backend stage failed, with which errno.
+        const detail = { errno: error.errno, ...(error.step ? { step: error.step } : {}) };
         if (error.errno === -6 || error.errno === 4000023 || error.errno === 400141 || error.errno === 450016) {
-          return errorResponse('Terabox session expired or invalid', 401);
+          return errorResponse('Terabox session expired or invalid', 401, detail);
         }
-        return errorResponse(error.message, statusFor(error));
+        return errorResponse(error.message, statusFor(error), detail);
       }
       log('error', 'unhandled error', { path: url.pathname, message: error instanceof Error ? error.message : String(error) });
       return errorResponse('Internal Server Error', 500);

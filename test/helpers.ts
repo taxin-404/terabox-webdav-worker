@@ -47,6 +47,10 @@ export class MockTerabox {
 	nodes = new Map<string, MockNode>();
 	private uploads = new Map<string, Map<number, Uint8Array>>();
 
+	/** Test knobs: force an endpoint to fail with this errno (0 = healthy). */
+	membershipErrno = 0;
+	precreateErrno = 0;
+
 	constructor() {
 		this.nodes.set('/', { path: '/', name: '', isdir: 1, size: 0, server_mtime: 1704067200, md5: '' });
 	}
@@ -244,6 +248,7 @@ export class MockTerabox {
 				return json({ errno: 0, md5: encodeMD5(real), uploadid: uploadId });
 			}
 			if (pathname === '/api/precreate' && method === 'POST') {
+				if (this.precreateErrno) return json({ errno: this.precreateErrno });
 				const form = await this.formDataOf(req, init);
 				await form?.get('path');
 				const uploadId = 'upload-' + Math.random().toString(36).slice(2);
@@ -302,6 +307,7 @@ export class MockTerabox {
 				return json({ errno: 0, taskid: 0, info });
 			}
 			if (pathname === '/rest/2.0/membership/proxy/user') {
+				if (this.membershipErrno) return json({ errno: this.membershipErrno });
 				return json({ errno: 0, data: { member_info: { is_vip: 0 } } });
 			}
 			if (pathname === '/rest/2.0/pcs/file') {

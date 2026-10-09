@@ -53,12 +53,25 @@ const TERABOX_ERRORS: Record<number, string> = {
 };
 
 export class TeraboxError extends Error {
+  /** Pipeline stage that failed ("precreate", "chunk1", ...), for diagnostics. */
+  step?: string;
+
   constructor(
     public readonly errno: number,
     message: string,
   ) {
     super(message);
     this.name = 'TeraboxError';
+  }
+}
+
+/** Run fn, stamping any TeraboxError with the stage that failed. */
+async function atStep<T>(step: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (error instanceof TeraboxError && !error.step) error.step = step;
+    throw error;
   }
 }
 
@@ -429,12 +442,18 @@ export class TeraboxClient {
 
   private async checkPremium(): Promise<void> {
     if (this.premiumChecked) return;
-    const { json } = await this.request<{
-      errno?: number;
-      data?: { member_info?: { is_vip?: number } };
-    }>('/rest/2.0/membership/proxy/user', { query: { method: 'query', membership_version: '1.0' } });
-    this.isPremium = (json.data?.member_info?.is_vip || 0) > 0;
     this.premiumChecked = true;
+    try {
+      const { json } = await this.request<{
+        errno?: number;
+        data?: { member_info?: { is_vip?: number } };
+      }>('/rest/2.0/membership/proxy/user', { query: { method: 'query', membership_version: '1.0' } });
+      this.isPremium = (json.data?.member_info?.is_vip || 0) > 0;
+    } catch {
+      // bclone discards this probe's error too (`_ = f.apiCheckPremium(ctx)`):
+      // a failed premium check must not block uploads — fall back to
+      // free-tier limits (4 MiB chunks, 4 GiB file cap) until proven VIP.
+    }
   }
 
   private async precreate(absPath: string, size: number, mtimeMs: number): Promise<{ uploadId: string; returnType: number }> {
@@ -520,10 +539,12 @@ export class TeraboxClient {
     const limit = this.isPremium ? MAX_PREMIUM_FILE_BYTES : MAX_FREE_FILE_BYTES;
     if (size > limit) throw es(58);
 
-    const host = await this.ensureUploadHost();
-    await this.ensureJsToken();
+    const host = await atStep('locateupload', () => this.ensureUploadHost());
+    await atStep('jsToken', () => this.ensureJsToken());
 
-    const { uploadId, returnType } = await this.precreate(absPath, size, mtimeMs);
+    const { uploadId, returnType } = await atStep('precreate', () =>
+      this.precreate(absPath, size, mtimeMs),
+    );
     if (returnType === 2) throw es(-8);
 
     const chunkSize = getChunkSize(size, this.isPremium);
@@ -540,13 +561,17 @@ export class TeraboxClient {
 
     const chunkMd5s = chunks.map((chunk) => chunk.md5);
     for (const chunk of chunks) {
-      const uploadedMd5 = await this.uploadChunk(host, absPath, uploadId, chunk.partSeq, chunk.data);
+      const uploadedMd5 = await atStep(`chunk${chunk.partSeq}`, () =>
+        this.uploadChunk(host, absPath, uploadId, chunk.partSeq, chunk.data),
+      );
       if (uploadedMd5 !== chunk.md5) {
         throw new TeraboxError(-5, `Uploaded chunk ${chunk.partSeq} md5 mismatch`);
       }
     }
 
-    const createdMd5 = await this.createFile(absPath, uploadId, size, mtimeMs, chunkMd5s, overwriteMode);
+    const createdMd5 = await atStep('create', () =>
+      this.createFile(absPath, uploadId, size, mtimeMs, chunkMd5s, overwriteMode),
+    );
 
     const controlMd5 =
       chunkMd5s.length === 1 ? chunkMd5s[0]! : await md5Hex(new TextEncoder().encode(JSON.stringify(chunkMd5s)));
