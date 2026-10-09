@@ -40,13 +40,12 @@ Prefer secrets over vars: `COOKIE` is genuine credentials.
 
 ## Auto-deploy via the Cloudflare dashboard
 
-The Worker auto-deploys from Git, the same way the NodeWarden Worker does: the
-dashboard's Git integration watches the `test` branch and deploys on every
-push. `main` stays for reviewed/stable changes that you merge or promote.
+The Worker auto-deploys from Git: the dashboard's Git integration watches
+`main` and deploys on every push.
 
 1. Dashboard → **Workers & Pages → Create application → Connect to Git**.
 2. Choose `taxin-404/terabox-webdav-worker`.
-3. Set **Production branch** to `test`.
+3. Set **Production branch** to `main`.
 4. Leave **Root directory** and **Build output directory** empty (this is a
    pure Worker, no assets).
 5. Set **Build command** to:
@@ -57,12 +56,7 @@ push. `main` stays for reviewed/stable changes that you merge or promote.
    secrets (`USERS`, `COOKIE`) and optionally the `TERABOX_DOMAIN` variable.
    Dashboard deploys do not read `.dev.vars` or `wrangler secret put`.
 
-Push flow:
-
-```sh
-git push origin test            # triggers an auto-deploy
-git commit --allow-empty -m "deploy" && git push origin test   # redeploy without changes
-```
+Every `git push origin main` triggers a deploy.
 
 ## rclone usage
 
