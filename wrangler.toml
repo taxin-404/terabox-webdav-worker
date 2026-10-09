@@ -7,11 +7,17 @@ preview_urls = true
 [observability]
 enabled = true
 
+# Non-sensitive runtime config lives HERE, so every deployment re-applies it.
+# Wrangler's default deletes all dashboard-only plain-text vars before each
+# deploy (see --keep-vars); secrets are never deleted — so CREDENTIALS
+# (USERS/COOKIE/JSTOKEN) must be set as *Secrets* in the dashboard only:
+# this repo is public, never put them here.
+[vars]
+TERABOX_DOMAIN = "https://dm.terabox.com"
+MIN_GAP_MS = "400"
+
 # Comma or newline separated "user:password". Reject all requests when unset.
 # vars = { USERS = "user:pass" }
 
 # Terabox session cookie. Full cookie string or bare "ndus" value.
 # vars = { COOKIE = "ndus=...; lang=en" }
-
-# Optional alternate Terabox mirror host (defaults to https://www.terabox.com).
-# vars = { TERABOX_DOMAIN = "https://www.terabox.com" }
