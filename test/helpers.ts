@@ -311,6 +311,9 @@ export class MockTerabox {
 				return json({ errno: 0, data: { member_info: { is_vip: 0 } } });
 			}
 			if (pathname === '/rest/2.0/pcs/file') {
+				// Mirrors live: upload-host discovery answers 400141
+				// ("verification required") without the account-bound jsToken.
+				if (!url.searchParams.get('jsToken')) return json({ errno: 400141 });
 				return json({ errno: 0, host: new URL(UPLOAD_BASE).host });
 			}
 		}

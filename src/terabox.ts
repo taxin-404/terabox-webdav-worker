@@ -160,8 +160,11 @@ export class TeraboxClient {
       url.searchParams.set('app_id', APP_ID);
       url.searchParams.set('channel', CHANNEL);
       url.searchParams.set('clienttype', '0');
-      if (this.jsToken) url.searchParams.set('jsToken', this.jsToken);
     }
+    // The jsToken is account-bound auth (see ensureJsToken): send it on every
+    // API call once minted, even when the other common params are skipped —
+    // locateupload answers 400141 "verification required" without it.
+    if (this.jsToken) url.searchParams.set('jsToken', this.jsToken);
     for (const [key, value] of Object.entries(opts.query || {})) {
       url.searchParams.set(key, value);
     }
@@ -539,8 +542,8 @@ export class TeraboxClient {
     const limit = this.isPremium ? MAX_PREMIUM_FILE_BYTES : MAX_FREE_FILE_BYTES;
     if (size > limit) throw es(58);
 
-    const host = await atStep('locateupload', () => this.ensureUploadHost());
     await atStep('jsToken', () => this.ensureJsToken());
+    const host = await atStep('locateupload', () => this.ensureUploadHost());
 
     const { uploadId, returnType } = await atStep('precreate', () =>
       this.precreate(absPath, size, mtimeMs),
