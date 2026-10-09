@@ -105,7 +105,11 @@ const worker: ExportedHandler<Env> = {
       if (error instanceof TeraboxError) {
         log('error', `terabox errno ${error.errno}: ${error.message}`, { path: url.pathname, step: error.step });
         // Additive diagnostics: which backend stage failed, with which errno.
-        const detail = { errno: error.errno, ...(error.step ? { step: error.step } : {}) };
+        const detail = {
+          errno: error.errno,
+          ...(error.step ? { step: error.step } : {}),
+          ...(error.upstream ? { upstream: error.upstream } : {}),
+        };
         if (error.errno === -6 || error.errno === 4000023 || error.errno === 400141 || error.errno === 450016) {
           return errorResponse('Terabox session expired or invalid', 401, detail);
         }

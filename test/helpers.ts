@@ -248,7 +248,7 @@ export class MockTerabox {
 				return json({ errno: 0, md5: encodeMD5(real), uploadid: uploadId });
 			}
 			if (pathname === '/api/precreate' && method === 'POST') {
-				if (this.precreateErrno) return json({ errno: this.precreateErrno });
+				if (this.precreateErrno) return json({ errno: this.precreateErrno, msg: 'simulated verify required' });
 				const form = await this.formDataOf(req, init);
 				await form?.get('path');
 				const uploadId = 'upload-' + Math.random().toString(36).slice(2);

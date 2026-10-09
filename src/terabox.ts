@@ -55,6 +55,8 @@ const TERABOX_ERRORS: Record<number, string> = {
 export class TeraboxError extends Error {
   /** Pipeline stage that failed ("precreate", "chunk1", ...), for diagnostics. */
   step?: string;
+  /** Verbatim msg/errmsg from the upstream JSON, when the API provided one. */
+  upstream?: string;
 
   constructor(
     public readonly errno: number,
@@ -240,7 +242,17 @@ export class TeraboxClient {
         }
 
         const message = this.errorMessage(errno, `Terabox error ${errno}`);
-        throw new TeraboxError(errno, message);
+        const error = new TeraboxError(errno, message);
+        const upstream =
+          typeof json.msg === 'string'
+            ? json.msg
+            : typeof json.errmsg === 'string'
+              ? json.errmsg
+              : typeof json.message === 'string'
+                ? json.message
+                : '';
+        if (upstream) error.upstream = upstream;
+        throw error;
       }
     }
 
@@ -434,9 +446,14 @@ export class TeraboxClient {
 
   private async ensureUploadHost(): Promise<string> {
     if (this.uploadHost) return this.uploadHost;
+    // Unlike bclone (which sends no common params here), the live API answers
+    // 400141 "verification required" for locateupload from Cloudflare egress
+    // without the full app_id/channel/clienttype/jsToken set — send it like
+    // every other endpoint. (Official docs: superfile2's host normally comes
+    // from /oauth/tokeninfo upload_domain; locateupload is the web-flow
+    // equivalent — docs/terabox-openapi.md.)
     const { json } = await this.request<{ errno?: number; host?: string }>(
       '/rest/2.0/pcs/file?method=locateupload',
-      { skipCommonParams: true },
     );
     if (!json.host) throw es(-5);
     this.uploadHost = json.host;

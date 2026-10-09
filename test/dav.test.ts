@@ -217,9 +217,10 @@ describe('PUT and MKCOL parents', () => {
 		tb.precreateErrno = 4000023;
 		const res = await request('/stuck.txt', { method: 'PUT', body: 'x' });
 		expect(res.status).toBe(401);
-		const body = (await res.json()) as { error: string; errno?: number; step?: string };
+		const body = (await res.json()) as { error: string; errno?: number; step?: string; upstream?: string };
 		expect(body.errno).toBe(4000023);
 		expect(body.step).toBe('precreate');
+		expect(body.upstream).toBe('simulated verify required');
 	});
 });
 
