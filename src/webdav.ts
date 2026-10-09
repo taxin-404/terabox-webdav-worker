@@ -272,11 +272,22 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   }
   if ((item.isdir || 0) > 0) return errorResponse('Method Not Allowed', 405);
 
-  let downloadUrl = item.dlink || '';
-  if (!downloadUrl) {
-    downloadUrl = await client.downloadUrlFromId(String(item.fs_id));
+  // Candidate links, best first. The official /api/download dlink carries a
+  // server-issued verification token (chkv=1&chkbd=1&token=…) — Alist's
+  // "official" path, designed for non-browser clients. The plainer filemetas
+  // dlink gets 400141 "need verify" on its dm-d hop from datacenter IPs; if a
+  // flavour is gated we fall through to the next and rethrow the last error.
+  const candidates: string[] = [];
+  if (item.fs_id) {
+    try {
+      const official = await client.downloadLink(String(item.fs_id));
+      if (official) candidates.push(official);
+    } catch {
+      // official mint failed (sign/home info) — the filemetas dlink still may work
+    }
   }
-  if (!downloadUrl) return errorResponse('Gateway Timeout', 504);
+  if (item.dlink) candidates.push(item.dlink);
+  if (!candidates.length) return errorResponse('Gateway Timeout', 504);
 
   const headers = new Headers({
     'Content-Type': contentTypeFor(item.server_filename || ''),
@@ -286,21 +297,31 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   });
   if (item.md5) headers.set('ETag', `"${item.md5}"`);
   const range = request.headers.get('Range');
-  // Paced, cookie-authenticated stream fetch: retries a jsToken gate once and
-  // raises an errno-shaped body as TeraboxError instead of streaming it.
-  const upstream = await client.fetchDownload(downloadUrl, range);
-  if (!upstream.ok && upstream.status !== 206) {
-    return errorResponse('Bad Gateway', 502);
-  }
 
-  const contentLength = upstream.headers.get('Content-Length');
-  if (contentLength) headers.set('Content-Length', contentLength);
-  if (range) {
-    const contentRange = upstream.headers.get('Content-Range');
-    if (contentRange) headers.set('Content-Range', contentRange);
+  let lastError: unknown = new TeraboxError(-5, 'No usable download link');
+  for (const downloadUrl of [...new Set(candidates)]) {
+    try {
+      // Paced, cookie-authenticated stream fetch: retries a jsToken gate once
+      // and raises an errno-shaped body as TeraboxError instead of streaming it.
+      const upstream = await client.fetchDownload(downloadUrl, range);
+      if (!upstream.ok && upstream.status !== 206) {
+        lastError = new TeraboxError(-5, `Terabox download http error ${upstream.status}`);
+        continue;
+      }
+
+      const contentLength = upstream.headers.get('Content-Length');
+      if (contentLength) headers.set('Content-Length', contentLength);
+      if (range) {
+        const contentRange = upstream.headers.get('Content-Range');
+        if (contentRange) headers.set('Content-Range', contentRange);
+      }
+      if (isHead) return new Response(null, { status: upstream.status, headers });
+      return new Response(upstream.body, { status: upstream.status, headers });
+    } catch (error) {
+      lastError = error;
+    }
   }
-  if (isHead) return new Response(null, { status: upstream.status, headers });
-  return new Response(upstream.body, { status: upstream.status, headers });
+  throw lastError;
 }
 
 async function handlePut(request: Request, client: TeraboxClient, absPath: string): Promise<Response> {

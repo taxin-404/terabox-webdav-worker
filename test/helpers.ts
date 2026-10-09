@@ -58,6 +58,9 @@ export class MockTerabox {
 	 *  'once' passes requests carrying jsToken (proves the retry remedy),
 	 *  'always' fails every request (proves the mapped error path). */
 	gateDownloads: 'once' | 'always' | undefined;
+	/** Gate every dlink EXCEPT the official /api/download one (proves the
+	 *  candidate ladder prefers the token-bearing official flavour). */
+	gateNormalDl = false;
 
 	constructor() {
 		this.nodes.set('/', { path: '/', name: '', isdir: 1, size: 0, server_mtime: 1704067200, md5: '' });
@@ -65,7 +68,9 @@ export class MockTerabox {
 
 	seed(path: string, opts: { content?: string | Uint8Array } & Omit<Partial<MockNode>, 'content'> = {}): MockNode {
 		const content = typeof opts.content === 'string' ? TEXT(opts.content) : opts.content;
-		const fsId = `fs-${this.nodes.size + 1}`;
+		// Real Terabox fs_ids are numeric — downloadLink() sends them as
+		// unquoted numbers in fidlist, so string ids ("fs-2") would never match.
+		const fsId = String(1000000 + this.nodes.size);
 		if (opts.isdir) {
 			const node: MockNode = {
 				path,
@@ -157,7 +162,10 @@ export class MockTerabox {
 
 		// Direct download links served by the CDN mock.
 		if (pathname.startsWith('/dl/')) {
+			const official = url.searchParams.get('via') === 'official';
+			const normalGate = this.gateNormalDl && !official;
 			const gated =
+				normalGate ||
 				this.gateDownloads === 'always' ||
 				(this.gateDownloads === 'once' && !url.searchParams.has('jsToken'));
 			if (gated) {
@@ -232,7 +240,11 @@ export class MockTerabox {
 				const nodes = [...this.nodes.values()].filter((n) => n.fs_id && want.has(n.fs_id));
 				return json({
 					errno: 0,
-					dlink: nodes.slice(0, 1).map((n) => ({ fs_id: n.fs_id, dlink: `${BASE}/dl/${encodeURIComponent(n.path)}` })),
+					dlink: nodes.slice(0, 1).map((n) => ({
+						fs_id: n.fs_id,
+						// `via=official` marks the token-bearing official flavour.
+						dlink: `${BASE}/dl/${encodeURIComponent(n.path)}?via=official`,
+					})),
 				});
 			}
 			if (pathname === '/api/create' && method === 'POST') {

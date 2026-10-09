@@ -241,6 +241,7 @@ export class TeraboxClient {
 
     if (!opts.bare && !opts.skipCommonParams) {
       url.searchParams.set('app_id', APP_ID);
+      url.searchParams.set('web', '1'); // browser/alist parity: every web API call carries it
       url.searchParams.set('channel', CHANNEL);
       url.searchParams.set('clienttype', '0');
     }

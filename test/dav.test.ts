@@ -170,6 +170,13 @@ describe('GET / HEAD', () => {
 		expect(await res.text()).toBe('the quick brown fox\n');
 	});
 
+	it('prefers the official token dlink when the plain one is gated', async () => {
+		tb.gateNormalDl = true;
+		const res = await request('/a.txt');
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('the quick brown fox\n');
+	});
+
 	it('maps a persistent dlink gate to 401 and names the host', async () => {
 		tb.gateDownloads = 'always';
 		const res = await request('/a.txt');
