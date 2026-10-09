@@ -170,8 +170,26 @@ describe('GET / HEAD', () => {
 		expect(await res.text()).toBe('the quick brown fox\n');
 	});
 
-	it('prefers the official token dlink when the plain one is gated', async () => {
-		tb.gateNormalDl = true;
+	it('uses the pcs app-protocol route when the web dlinks are gated', async () => {
+		tb.gateDl = ['plain', 'official'];
+		const res = await request('/a.txt');
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('the quick brown fox\n');
+		// rclone-style ranged GET must survive the pcs 302 hop too.
+		const ranged = await request('/a.txt', { headers: { Range: 'bytes=0-2' } });
+		expect(ranged.status).toBe(206);
+		expect(await ranged.text()).toBe('the');
+	});
+
+	it('falls back to the official token dlink when plain and pcs links are gated', async () => {
+		tb.gateDl = ['plain', 'pcs'];
+		const res = await request('/a.txt');
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('the quick brown fox\n');
+	});
+
+	it('treats a pcs error_code gate body as an error, never content', async () => {
+		tb.gatePcs = true;
 		const res = await request('/a.txt');
 		expect(res.status).toBe(200);
 		expect(await res.text()).toBe('the quick brown fox\n');

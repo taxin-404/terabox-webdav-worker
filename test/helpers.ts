@@ -58,9 +58,15 @@ export class MockTerabox {
 	 *  'once' passes requests carrying jsToken (proves the retry remedy),
 	 *  'always' fails every request (proves the mapped error path). */
 	gateDownloads: 'once' | 'always' | undefined;
-	/** Gate every dlink EXCEPT the official /api/download one (proves the
-	 *  candidate ladder prefers the token-bearing official flavour). */
-	gateNormalDl = false;
+	/** Gate /dl/ targets reached via specific link flavours (the live web
+	 *  dlink gate): 'plain' = filemetas dlink, 'official' = /api/download,
+	 *  'pcs' = the 302 Location of the app-protocol route. Proves which
+	 *  candidate in the ladder actually served the bytes. */
+	gateDl: Array<'plain' | 'official' | 'pcs'> = [];
+	/** Answer the PCS route itself with a 200 {error_code:400141} gate body
+	 *  (app-route shape, pre-redirect) — proves error_code JSON is raised as
+	 *  an error instead of streamed as file content. */
+	gatePcs = false;
 
 	constructor() {
 		this.nodes.set('/', { path: '/', name: '', isdir: 1, size: 0, server_mtime: 1704067200, md5: '' });
@@ -162,10 +168,9 @@ export class MockTerabox {
 
 		// Direct download links served by the CDN mock.
 		if (pathname.startsWith('/dl/')) {
-			const official = url.searchParams.get('via') === 'official';
-			const normalGate = this.gateNormalDl && !official;
+			const flavour = (url.searchParams.get('via') || 'plain') as 'plain' | 'official' | 'pcs';
 			const gated =
-				normalGate ||
+				this.gateDl.includes(flavour) ||
 				this.gateDownloads === 'always' ||
 				(this.gateDownloads === 'once' && !url.searchParams.has('jsToken'));
 			if (gated) {
@@ -341,11 +346,27 @@ export class MockTerabox {
 			}
 		}
 
+		// PCS app-protocol download (the ladder's first candidate): the session
+		// cookie in, 302 straight to the CDN — no /file/<hash> dlink hop.
+		if (pathname === '/rest/2.0/pcs/file' && url.searchParams.get('method') === 'download') {
+			if (this.gatePcs) {
+				return json({ request_id: 'mock-pcs-gate', error_code: 400141, error_msg: 'need verify' });
+			}
+			const path = url.searchParams.get('path') || '';
+			const node = this.nodes.get(path);
+			if (!node || node.isdir) return json({ error_code: -9, error_msg: "file doesn't exist" }, 404);
+			// The live endpoint mints a fresh Location per request; via=pcs marks
+			// which ladder flavour served the bytes for assertions.
+			const location = new URL(`${BASE}/dl/${encodeURIComponent(path)}`);
+			location.searchParams.set('via', 'pcs');
+			return new Response(null, { status: 302, headers: { Location: location.toString() } });
+		}
+
 		// Upload-host discovery: the configured base origin answers with the
 		// account's own cluster list (live: dm.terabox.com → dm1/dm2/kul-cdata)
 		// — mirror that here. d.terabox.com / <prefix>-data.terabox.com are
 		// valid fallbacks; everything else answers 400141 "need verify".
-		if (pathname === '/rest/2.0/pcs/file') {
+		if (pathname === '/rest/2.0/pcs/file' && url.searchParams.get('method') === 'locateupload') {
 			const ok =
 				url.hostname === new URL(BASE).hostname ||
 				url.hostname === 'd.terabox.com' ||

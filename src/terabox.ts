@@ -162,13 +162,17 @@ function errnoBodyFrom(text: string): { errno: number; msg: string } | null {
   }
   if (typeof json !== 'object' || json === null) return null;
   const record = json as Record<string, unknown>;
-  const errno = Number(record.errno);
+  // The web API speaks `errno`; the PCS/app routes speak `error_code`
+  // ({"error_code":31045,"error_msg":…}). Both shapes must be caught here —
+  // a download response shaped like either one is a gate/error, never content.
+  const errno = Number(record.errno !== undefined ? record.errno : record.error_code);
   if (!Number.isFinite(errno) || errno === 0) return null;
   const marked =
     'request_id' in record ||
     'request_id_string' in record ||
     'errmsg' in record ||
-    'error_msg' in record;
+    'error_msg' in record ||
+    'error_code' in record;
   if (!marked) return null;
   const msg =
     typeof record.errmsg === 'string'
@@ -528,12 +532,37 @@ export class TeraboxClient {
   }
 
   /**
-   * Fetch a signed dlink stream. The signed URL still requires the session
-   * Cookie (bare → HTTP 403), and from datacenter IPs the endpoint answers
-   * 400141 "need verify" even with it — the same gate the API remedies with a
-   * jsToken, so retry once with a freshly minted token. An errno-shaped body
-   * must never stream out as file content: it becomes a TeraboxError stamped
-   * with `dlink@<host>` so live failures name the exact host that gated.
+   * PCS app-protocol download URLs (mobile/desktop app parity): GET
+   * `/rest/2.0/pcs/file?method=download&path=…` with the session cookie
+   * answers a 302 straight to the CDN — there is no signed `/file/<hash>`
+   * dlink hop, and that hop is exactly what answers 400141 "need verify"
+   * from datacenter IPs. The route family is the same one locateupload runs
+   * on (live-proven reachable from Cloudflare), so candidates lead the
+   * download ladder. Hosts mirror `ensureUploadHosts`: the deployment's own
+   * data gateway first, then `<label>-data`, then the configured origin.
+   */
+  pcsDownloadUrls(absPath: string): string[] {
+    const query = `method=download&app_id=${APP_ID}&path=${encodeURIComponent(tbPath(absPath))}`;
+    const hostname = new URL(this.baseUrl).hostname;
+    const label = hostname.split('.')[0] ?? '';
+    const hosts =
+      label && label !== 'www'
+        ? [`${label}-d.terabox.com`, `${label}-data.terabox.com`, hostname]
+        : [hostname, 'd.terabox.com'];
+    return hosts.map((host) => `https://${host}/rest/2.0/pcs/file?${query}`);
+  }
+
+  /**
+   * Fetch a signed dlink or PCS download stream. The signed URL still requires
+   * the session Cookie (bare → HTTP 403), and from datacenter IPs the /file/
+   * endpoint answers 400141 "need verify" even with it — the same gate the API
+   * remedies with a jsToken, so retry once with a freshly minted token. Both
+   * the dlink and the app-protocol route answer with a 302 to a capability URL
+   * on the CDN; we follow that hop by hand (Alist parity): the session Cookie
+   * never leaves the API origin and Range rides along, so partial GETs survive
+   * the redirect. An errno-shaped body must never stream out as file content:
+   * it becomes a TeraboxError stamped with `dlink@<host>` so live failures
+   * name the exact host that gated.
    */
   async fetchDownload(url: string, range?: string | null): Promise<Response> {
     // Follow the browser: fetch the rewritten main-origin URL, not the gated
@@ -561,8 +590,21 @@ export class TeraboxClient {
 
       await this.pace(); // rate-limit guard before the download stream too
       let response: Response;
+      let finalUrl = target;
       try {
-        response = await fetch(target, { headers, redirect: 'follow' });
+        response = await fetch(target, { headers, redirect: 'manual' });
+        // Follow the CDN hop ourselves: the redirect target is a capability
+        // URL that serves bytes with no session, so only the UA (and Range)
+        // cross the hop.
+        for (let hop = 0; response.status >= 300 && response.status < 400 && hop < 4; hop++) {
+          const location = response.headers.get('Location');
+          if (!location) break;
+          finalUrl = new URL(location, finalUrl).toString();
+          await this.pace();
+          const hopHeaders: Record<string, string> = { 'User-Agent': WEB_USER_AGENT, Accept: '*/*' };
+          if (range) hopHeaders['Range'] = range;
+          response = await fetch(finalUrl, { headers: hopHeaders, redirect: 'manual' });
+        }
       } catch (error) {
         throw new TeraboxError(
           -5,
@@ -570,7 +612,7 @@ export class TeraboxClient {
         );
       }
 
-      const host = downloadHost(response.url || target, target);
+      const host = downloadHost(finalUrl, target);
       const verdict = await this.classifyDownload(response, host);
       if (!verdict.error) return verdict.response;
       if (attempt === 0 && JS_TOKEN_ERRORS.has(verdict.error.errno)) {

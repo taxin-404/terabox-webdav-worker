@@ -272,23 +272,6 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   }
   if ((item.isdir || 0) > 0) return errorResponse('Method Not Allowed', 405);
 
-  // Candidate links, best first. The official /api/download dlink carries a
-  // server-issued verification token (chkv=1&chkbd=1&token=…) — Alist's
-  // "official" path, designed for non-browser clients. The plainer filemetas
-  // dlink gets 400141 "need verify" on its dm-d hop from datacenter IPs; if a
-  // flavour is gated we fall through to the next and rethrow the last error.
-  const candidates: string[] = [];
-  if (item.fs_id) {
-    try {
-      const official = await client.downloadLink(String(item.fs_id));
-      if (official) candidates.push(official);
-    } catch {
-      // official mint failed (sign/home info) — the filemetas dlink still may work
-    }
-  }
-  if (item.dlink) candidates.push(item.dlink);
-  if (!candidates.length) return errorResponse('Gateway Timeout', 504);
-
   const headers = new Headers({
     'Content-Type': contentTypeFor(item.server_filename || ''),
     'Last-Modified': rfc1123((item.server_mtime || 0) * 1000),
@@ -299,14 +282,15 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   const range = request.headers.get('Range');
 
   let lastError: unknown = new TeraboxError(-5, 'No usable download link');
-  for (const downloadUrl of [...new Set(candidates)]) {
+  /** Try one candidate; resolves the ready-to-stream Response or records why it failed. */
+  const tryUrl = async (downloadUrl: string): Promise<Response | undefined> => {
     try {
       // Paced, cookie-authenticated stream fetch: retries a jsToken gate once
       // and raises an errno-shaped body as TeraboxError instead of streaming it.
       const upstream = await client.fetchDownload(downloadUrl, range);
       if (!upstream.ok && upstream.status !== 206) {
         lastError = new TeraboxError(-5, `Terabox download http error ${upstream.status}`);
-        continue;
+        return undefined;
       }
 
       const contentLength = upstream.headers.get('Content-Length');
@@ -319,7 +303,35 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
       return new Response(upstream.body, { status: upstream.status, headers });
     } catch (error) {
       lastError = error;
+      return undefined;
     }
+  };
+
+  // Phase 1: the PCS app-protocol route (mobile/desktop parity) — cookie in,
+  // 302 straight to the CDN, no /file/<hash> dlink hop (that hop gates
+  // datacenter IPs with 400141 "need verify"). No minting, so the happy path
+  // costs a single upstream call.
+  for (const url of client.pcsDownloadUrls(absPath)) {
+    const res = await tryUrl(url);
+    if (res) return res;
+  }
+  // Phase 2: the official /api/download dlink (token-bearing, Alist parity) —
+  // minted lazily so the fast path never pays for home/info + sign.
+  if (item.fs_id) {
+    try {
+      const official = await client.downloadLink(String(item.fs_id));
+      if (official) {
+        const res = await tryUrl(official);
+        if (res) return res;
+      }
+    } catch {
+      // official mint failed (sign/home info) — the filemetas dlink still may work
+    }
+  }
+  // Phase 3: the plain filemetas dlink; every flavour gated rethrows the last error.
+  if (item.dlink) {
+    const res = await tryUrl(item.dlink);
+    if (res) return res;
   }
   throw lastError;
 }
