@@ -82,10 +82,66 @@ so a conservative worker-side pacing of ~1 request / 400 ms with 429-aware
 backoff (cap 5 s, honour `Retry-After`) matches the reference without hurting
 interactive PROPFIND latency much (each WebDAV call = 1–2 upstream calls).
 
-## Open work (next sessions)
+## Campaign 2 — upload fix (400141 → 31045)
 
-1. Fix upload 401 (#1) — instrument or reproduce `precreate`/`create` errno.
-2. Add pacing + 429 backoff to `TeraboxClient.request()` per values above.
+Live PUT debugging on 2026-10-09, step by step (each entry = pushed, waited
+for dashboard deploy, retested):
+
+| # | Commit | Change | Live result |
+|---|---|---|---|
+| 1 | `5a2cf39` | full common params on `locateupload` (www origin) | still `400141 "need verify"` |
+| 2 | `5b76fd7` | bare GET on `jp-data.terabox.com` (Alist parity) | **locateupload ✓, precreate ✓**, `chunk0` → HTTP 403 |
+| 3 | `554003d` | capture non-2xx bodies + host into errors | body = `{"error_code":31045,"error_msg":"user not exists"}` on `c-jp.terabox.com` |
+| 4 | `dc86a87` | union of Alist+CLI chunk params (web, type, no jsToken, browser headers) | same 31045 |
+| 5 | `93d9714` | walk locateupload's `server[]` candidates (browser parity) | failover works, **all** of `c-jp/c1-jp/c2-jp` → 31045 |
+| 6 | `367b895` | sessioned discovery, drop `type`, `cookieKeys` diagnostics | `cookieKeys:["ndus"]`; jsToken mint gated (`step=jsToken`) |
+| 7 | `8f98c39` | pacing + `JSTOKEN` env + mint fallback/anon-probe | mint recovered; 31045 persists |
+| 8 | `72b499c` | thread precreate's `uploadsign` (browser never hardcodes 0) | 31045 persists |
+
+### Key discoveries
+
+- **Authoritative upload flow** lives in the public web app bundles:
+  `s5.teraboxcdn.com/fe-opera-static/node-static-v4/fe-webv4-main/js/`
+  (`manifest.*.js` maps `chunk-<id>` → `chunk-<id>.<hash>.js`;
+  `chunk-78587962` = upload manager, `chunk-75e18d29` = endpoint bootstrap).
+- **Discovery**: the browser GETs `//d.terabox.com/rest/2.0/pcs/file?method=locateupload`
+  (bare works: returns `{"client_ip":…,"server":["c-jp","c1-jp","c2-jp"],
+  "host":"c-jp.terabox.com","expire":600}`) and **walks `server[]` until a
+  cluster accepts the upload**. Worker mirrors this with a
+  `<prefix>-data.terabox.com` fallback origin.
+- **Superfile2 query (browser)**: `method=upload&app_id=250528&channel=dubox&clienttype=0&web=1&logid=…`
+  + `path&uploadid&uploadsign&partseq` (`_compileUrl`); no `jsToken`,
+  no `type` — identity = session cookies only. `uploadsign` comes from
+  the **precreate response** (`e.uploadSign = o.uploadsign`), not a constant.
+- **Error 31045 "user not exists"** is Baidu-PCS-speak for *credential
+  validation failed* (`access_token验证未通过` / session expired — see
+  cssxsh/baidu-client `OTHER.md`, bypy#511). Not a wrong-cluster error:
+  all `c*-jp` clusters reject the `ndus`-only cookie; www APIs accept it.
+  **Alist/OpenList/TeraboxUploaderCLI all have users paste the FULL browser
+  cookie (ndus + stoken + BAIDUID …).**
+- **jsToken minting** (`GET /` → `window.jsToken` snippet) is IP/session
+  sensitive: the root answers 302 `/simple-verify` when gated. Mitigations
+  now in code: optional `JSTOKEN` secret (paste `window.jsToken`, Alist/CLI
+  style), 5-min isolate cache, `/main?category=all` fallback, anonymous
+  probe on failure reported via `upstream` (`/login=token anon:/login=token`).
+- `cookieKeys` in error bodies = cookie **names only** (never values).
+
+### Rate pacing shipped (`8f98c39`)
+
+- Shared per-isolate slot scheduler: every outbound call (API, jsToken mint,
+  download stream) waits for `MIN_GAP_MS` (default 400 — bclone `minSleep`),
+  env-overridable, set to `0` in vitest bindings.
+- `429/5xx` retries honour `Retry-After` (cap 5 s) before attempt backoff.
+- jsToken re-mint ≤ 1 per 5 min — the root page (most gate-exposed call) is
+  no longer hit once per WebDAV request.
+
+### Status / open work
+
+1. **Awaiting user-provided full cookie + `window.jsToken`** → set
+   `COOKIE` (replace ndus-only) and `JSTOKEN` in the Cloudflare dashboard
+   (Workers → Settings → Variables and Secrets), then retest PUT.
+2. If 31045 survives the full cookie: add browser `logid` param; check
+   whether pcs needs `uid` (fid prefix seen in thumbnails: `<uid>-250528-…`).
 3. Fix Range/206 passthrough and HEAD `Content-Length` (#3, #4).
 4. Re-run `test/live/webdav-livetest.sh` and update this file.
 
