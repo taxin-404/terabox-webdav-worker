@@ -1,0 +1,20 @@
+{
+  "name": "terabox-webdav-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && wrangler deploy --dry-run",
+    "test": "vitest"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.16.3",
+    "@cloudflare/workers-types": "^4.20260630.1",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.0",
+    "wrangler": "^4.146.0"
+  }
+}
