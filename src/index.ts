@@ -104,11 +104,16 @@ const worker: ExportedHandler<Env> = {
     } catch (error) {
       if (error instanceof TeraboxError) {
         log('error', `terabox errno ${error.errno}: ${error.message}`, { path: url.pathname, step: error.step });
-        // Additive diagnostics: which backend stage failed, with which errno.
+        // Additive diagnostics: which backend stage failed, with which errno,
+        // plus the cookie *names* in play (never values) to catch auth gaps.
         const detail = {
           errno: error.errno,
           ...(error.step ? { step: error.step } : {}),
           ...(error.upstream ? { upstream: error.upstream } : {}),
+          cookieKeys: String(env.COOKIE)
+            .split(';')
+            .map((part) => part.split('=')[0]?.trim())
+            .filter(Boolean),
         };
         if (error.errno === -6 || error.errno === 4000023 || error.errno === 400141 || error.errno === 450016) {
           return errorResponse('Terabox session expired or invalid', 401, detail);

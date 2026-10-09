@@ -490,20 +490,28 @@ export class TeraboxClient {
     const origins = ['https://d.terabox.com', `https://${this.domainPrefix}-data.terabox.com`];
     let lastError: unknown;
     for (const origin of origins) {
-      try {
-        const { json } = await this.request<{ errno?: number; server?: string[]; host?: string }>(
-          '/rest/2.0/pcs/file?method=locateupload',
-          { absoluteUrl: `${origin}/rest/2.0/pcs/file?method=locateupload`, bare: true },
-        );
-        const candidates = [
-          ...(Array.isArray(json.server) ? json.server : []),
-          ...(json.host ? [json.host] : []),
-        ].filter((host, index, all) => Boolean(host) && all.indexOf(host) === index);
-        if (!candidates.length) throw es(-5);
-        this.uploadHosts = candidates;
-        return candidates;
-      } catch (error) {
-        lastError = error;
+      // Browser parity: the XHR runs withCredentials (session Cookie) with
+      // only its own query; fall back to a bare GET for origins that gate
+      // sessioned callers from datacenter IPs.
+      for (const session of [true, false]) {
+        try {
+          const { json } = await this.request<{ errno?: number; server?: string[]; host?: string }>(
+            '/rest/2.0/pcs/file?method=locateupload',
+            {
+              absoluteUrl: `${origin}/rest/2.0/pcs/file?method=locateupload`,
+              ...(session ? { skipCommonParams: true } : { bare: true }),
+            },
+          );
+          const candidates = [
+            ...(Array.isArray(json.server) ? json.server : []),
+            ...(json.host ? [json.host] : []),
+          ].filter((host, index, all) => Boolean(host) && all.indexOf(host) === index);
+          if (!candidates.length) throw es(-5);
+          this.uploadHosts = candidates;
+          return candidates;
+        } catch (error) {
+          lastError = error;
+        }
       }
     }
     throw lastError instanceof Error ? lastError : es(-5);
@@ -568,8 +576,10 @@ export class TeraboxClient {
         absoluteUrl: `https://${host}/rest/2.0/pcs/superfile2`,
         skipCommonParams: true, // no jsToken; the common params are listed below
         query: {
+          // Exact web-client superfile2 query (_setServerUrl + _compileUrl in
+          // chunk-78587962): no jsToken, no type param — identity comes from
+          // the session Cookie alone.
           method: 'upload',
-          type: 'tmpfile',
           web: '1',
           app_id: APP_ID,
           channel: CHANNEL,
