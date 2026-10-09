@@ -85,6 +85,10 @@ export interface ApiOptions {
   skipCommonParams?: boolean;
   /** The response is not an ErrorAPI shape (chunk upload); skip errno handling. */
   skipErrorRetry?: boolean;
+  /** Return the JSON even when the top-level errno is non-zero, so the caller
+   *  can read the authoritative per-item `info[].errno` (filemetas returns
+   *  top-level 12 alongside info[].errno -9 for missing paths). */
+  raw?: boolean;
   /** Absolute URL override (chunk upload host). */
   absoluteUrl?: string;
 }
@@ -213,6 +217,11 @@ export class TeraboxClient {
           return this.request<T>(path, opts, attempt, jsTokenTried);
         }
 
+        // The caller wants to inspect info[] itself; retries above still ran.
+        if (opts.raw) {
+          return { json: json as T, headers: response.headers, status: response.status };
+        }
+
         const message = this.errorMessage(errno, `Terabox error ${errno}`);
         throw new TeraboxError(errno, message);
       }
@@ -269,16 +278,23 @@ export class TeraboxClient {
   /** Resolve a single item by absolute path. When downloadLink is true the
    *  response includes a direct download URL. */
   async itemInfo(path: string, downloadLink: boolean): Promise<TeraboxItem> {
+    // raw: filemetas reports a missing target as top-level errno 12 with the
+    // real cause in info[0].errno (-9), so we must read info[] ourselves.
     const { json } = await this.request<{
       errno?: number;
       info?: Array<{ errno?: number } & TeraboxItem>;
     }>('/api/filemetas', {
       query: { target: JSON.stringify([tbPath(path)]), dlink: downloadLink ? '1' : '0' },
+      raw: true,
     });
     const entry = json.info?.[0];
-    if (!entry) throw es(-9);
-    if (entry.errno !== undefined && entry.errno !== 0) throw es(entry.errno);
-    return entry;
+    if (entry) {
+      if (entry.errno !== undefined && entry.errno !== 0) throw es(entry.errno);
+      return entry;
+    }
+    // No per-item detail: fall back to whatever the top-level errno says.
+    if (json.errno) throw es(json.errno);
+    throw es(-9);
   }
 
   /** Create a directory at an absolute path. */
@@ -348,6 +364,7 @@ export class TeraboxClient {
       method: 'POST',
       query: { opera, async: opera === 'copy' ? '2' : '1', onnest: 'fail' },
       body,
+      raw: true,
     });
 
     if (json.taskid && json.taskid > 0) {
@@ -355,9 +372,12 @@ export class TeraboxClient {
       return;
     }
 
-    for (const entry of json.info || []) {
+    const infos = json.info || [];
+    for (const entry of infos) {
       if (entry.errno !== undefined && entry.errno !== 0) throw es(entry.errno);
     }
+    if (infos.length === 0 && json.errno) throw es(json.errno);
+    // -8 (already exists) may legitimately occur for non-task responses.
   }
 
   private async pollTask(taskId: number): Promise<void> {

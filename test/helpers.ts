@@ -200,7 +200,10 @@ export class MockTerabox {
 					if (!node) return { errno: -9, path: p };
 					return this.wire(node, dlink);
 				});
-				return json({ errno: 0, info });
+				// Real API: a missing target yields top-level errno 12 with the
+				// real cause in info[0].errno, never a bare top-level -9.
+				const anyMissing = info.some((entry) => entry.errno === -9);
+				return json({ errno: anyMissing ? 12 : 0, info });
 			}
 			if (pathname === '/api/download') {
 				const fidlist = JSON.parse(url.searchParams.get('fidlist') || '[]') as number[];
