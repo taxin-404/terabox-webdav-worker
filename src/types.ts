@@ -12,6 +12,14 @@ export interface Env {
   JSTOKEN?: string;
   // Minimum gap in ms between outbound Terabox calls (default 400).
   MIN_GAP_MS?: string;
+  // Optional base path the WebDAV surface is served under (gdrive parity),
+  // e.g. "/dav/": requests outside it 404, the bare base 301s to its slash
+  // form, and every emitted href includes it.
+  PATH?: string;
+  // Optional Terabox folder mounted as the WebDAV root (gdrive parity with
+  // ROOT_ID; Terabox keys folders by path, not by opaque id), e.g. "/backup".
+  // Unset or "/" mounts the whole account.
+  ROOT_ID?: string;
   // Optional per-request log tag.
   LOG_PREFIX?: string;
 }

@@ -16,6 +16,14 @@ enabled = true
 TERABOX_DOMAIN = "https://dm.terabox.com"
 MIN_GAP_MS = "400"
 
+# Optional base path the WebDAV surface is served under (gdrive parity),
+# e.g. serve only below /dav/ — requests outside it 404:
+# vars = { PATH = "/dav/" }
+
+# Optional Terabox folder mounted as the WebDAV root (gdrive parity with
+# ROOT_ID; Terabox identifies folders by path), e.g. only expose /backup:
+# vars = { ROOT_ID = "/backup" }
+
 # Comma or newline separated "user:password". Reject all requests when unset.
 # vars = { USERS = "user:pass" }
 

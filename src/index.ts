@@ -100,7 +100,7 @@ const worker: ExportedHandler<Env> = {
     const started = Date.now();
     log('info', `${request.method} ${url.pathname}`);
     try {
-      const response = await handleWebDav(request, client);
+      const response = await handleWebDav(request, client, { basePath: env.PATH, rootId: env.ROOT_ID });
       const elapsed = Date.now() - started;
       if (elapsed > 500) log('info', `slow ${request.method} ${url.pathname} (${elapsed}ms)`);
       return response;

@@ -89,6 +89,69 @@ export function decodePathname(pathname: string): string {
   return '/' + parts.join('/');
 }
 
+/**
+ * Mount mapping between the WebDAV namespace (what clients see) and the
+ * Terabox namespace (paths on the account). Mirrors the Google Drive worker's
+ * `PATH` (base subdirectory) and `ROOT_ID` (folder mounted as `/`) options:
+ * Terabox identifies folders by path, so ROOT_ID is a path like "/backup".
+ */
+export interface Mount {
+  /** Base subdirectory the surface is served under ("" when unset). */
+  base: string;
+  /** Terabox path that backs the WebDAV root ("/" when unset). */
+  root: string;
+  /** True when absPath *is* the WebDAV root resource (guards mutations). */
+  isRoot(absPath: string): boolean;
+  /** Terabox space → path relative to the mount root (no base). */
+  toDav(absPath: string): string;
+  /** WebDAV space (no base) → Terabox space. */
+  toTera(davPath: string): string;
+  /** Terabox space → WebDAV href path including the base. */
+  href(absPath: string): string;
+}
+
+/** Normalise PATH: "" / "/" → no base; "/dav/" → "/dav". */
+export function normalizeBasePath(raw?: string): string {
+  const value = (raw || '').trim();
+  if (!value || value === '/') return '';
+  const base = ('/' + value.replace(/^\/+/, '')).replace(/\/+$/, '');
+  return base === '' ? '' : base;
+}
+
+/** Normalise ROOT_ID: "" / "/" → whole account; "/backup/" → "/backup". */
+export function normalizeRootId(raw?: string): string {
+  const value = (raw || '').trim();
+  if (!value || value === '/') return '/';
+  const root = ('/' + value.replace(/^\/+/, '')).replace(/\/+$/, '');
+  return root === '' ? '/' : root;
+}
+
+export function makeMount(opts?: { basePath?: string; rootId?: string }): Mount {
+  const base = normalizeBasePath(opts?.basePath);
+  const root = normalizeRootId(opts?.rootId);
+  const toDav = (absPath: string): string => {
+    if (root === '/') return absPath;
+    if (absPath === root) return '/';
+    if (absPath.startsWith(root + '/')) {
+      const rel = absPath.slice(root.length);
+      return rel.startsWith('/') ? rel : '/' + rel;
+    }
+    return absPath;
+  };
+  const toTera = (davPath: string): string => {
+    if (root === '/') return davPath;
+    return davPath === '/' ? root : root + davPath;
+  };
+  return {
+    base,
+    root,
+    isRoot: (absPath: string) => absPath === root,
+    toDav,
+    toTera,
+    href: (absPath: string) => base + toDav(absPath),
+  };
+}
+
 async function itemToDentry(item: TeraboxItem): Promise<Dentry> {
   return {
     name: item.server_filename || '',
@@ -161,16 +224,36 @@ function multistatus(resource: DavResource, children: DavResource[]): Response {
  * Large-`Depth` listings are treated as children-only (same policy as the
  * Google Drive WebDAV worker).
  */
-export async function handleWebDav(request: Request, client: TeraboxClient): Promise<Response> {
+export async function handleWebDav(
+  request: Request,
+  client: TeraboxClient,
+  opts?: { basePath?: string; rootId?: string },
+): Promise<Response> {
+  const mount = makeMount(opts);
   const url = new URL(request.url);
   const method = request.method.toUpperCase();
-  let absPath: string;
+
+  // Base path (gdrive parity): the surface only exists below `mount.base`.
+  // The bare base redirects to its slash form; anything else outside 404s.
+  let pathname = url.pathname;
+  if (mount.base) {
+    if (pathname === mount.base) {
+      const redirect = new URL(request.url);
+      redirect.pathname = mount.base + '/';
+      return Response.redirect(redirect.toString(), 301);
+    }
+    if (!pathname.startsWith(mount.base + '/')) return errorResponse('Not Found', 404);
+    pathname = pathname.slice(mount.base.length);
+  }
+
+  let davPath: string;
   try {
-    absPath = decodePathname(url.pathname);
+    davPath = decodePathname(pathname);
   } catch (error) {
     return errorResponse(error instanceof Error ? error.message : 'Bad Request', 400);
   }
-  if (absPath.length > 1 && absPath.endsWith('/')) absPath = absPath.slice(0, -1);
+  if (davPath.length > 1 && davPath.endsWith('/')) davPath = davPath.slice(0, -1);
+  const absPath = mount.toTera(davPath);
 
   switch (method) {
     case 'OPTIONS':
@@ -184,24 +267,24 @@ export async function handleWebDav(request: Request, client: TeraboxClient): Pro
       });
 
     case 'PROPFIND':
-      return handlePropfind(request, client, url, absPath);
+      return handlePropfind(request, client, absPath, mount);
 
     case 'MKCOL':
-      return handleMkcol(client, absPath);
+      return handleMkcol(client, absPath, mount);
 
     case 'GET':
     case 'HEAD':
       return handleGet(request, client, absPath, method === 'HEAD');
 
     case 'PUT':
-      return handlePut(request, client, absPath);
+      return handlePut(request, client, absPath, mount);
 
     case 'DELETE':
-      return handleDelete(client, absPath);
+      return handleDelete(client, absPath, mount);
 
     case 'MOVE':
     case 'COPY':
-      return handleMoveCopy(request, client, url, absPath, method);
+      return handleMoveCopy(request, client, absPath, method, mount);
 
     default:
       return errorResponse('Method Not Allowed', 405);
@@ -211,14 +294,14 @@ export async function handleWebDav(request: Request, client: TeraboxClient): Pro
 async function handlePropfind(
   request: Request,
   client: TeraboxClient,
-  url: URL,
   absPath: string,
+  mount: Mount,
 ): Promise<Response> {
   const depth = request.headers.get('Depth') || '1';
   const resource = await statResource(client, absPath);
   if (!resource) return errorResponse('Not Found', 404);
 
-  const href = encodeHref(absPath, resource.isDir);
+  const href = encodeHref(mount.href(absPath), resource.isDir);
   if (depth === '0') {
     return multistatus({ ...resource, href }, []);
   }
@@ -238,7 +321,7 @@ async function handlePropfind(
     children = await Promise.all(
       items.map(async (item) => {
         const dent = await itemToDentry(item);
-        return { ...dent, href: encodeHref(joinPath(absPath, dent.name), dent.isDir) };
+        return { ...dent, href: encodeHref(mount.href(joinPath(absPath, dent.name)), dent.isDir) };
       }),
     );
   } catch (error) {
@@ -249,8 +332,8 @@ async function handlePropfind(
   return multistatus({ ...resource, href, isDir: true }, children);
 }
 
-async function handleMkcol(client: TeraboxClient, absPath: string): Promise<Response> {
-  if (absPath === '/' || absPath === '') return errorResponse('Forbidden', 403);
+async function handleMkcol(client: TeraboxClient, absPath: string, mount: Mount): Promise<Response> {
+  if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
   try {
     const existing = await statResource(client, absPath);
     if (existing) return errorResponse('Method Not Allowed', 405);
@@ -336,8 +419,8 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   throw lastError;
 }
 
-async function handlePut(request: Request, client: TeraboxClient, absPath: string): Promise<Response> {
-  if (absPath === '/' || absPath === '') return errorResponse('Forbidden', 403);
+async function handlePut(request: Request, client: TeraboxClient, absPath: string, mount: Mount): Promise<Response> {
+  if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
 
   const bytes = new Uint8Array(await request.arrayBuffer());
   const size = bytes.byteLength;
@@ -369,8 +452,8 @@ async function handlePut(request: Request, client: TeraboxClient, absPath: strin
   return new Response(null, { status: existed ? 204 : 201 });
 }
 
-async function handleDelete(client: TeraboxClient, absPath: string): Promise<Response> {
-  if (absPath === '/' || absPath === '') return errorResponse('Forbidden', 403);
+async function handleDelete(client: TeraboxClient, absPath: string, mount: Mount): Promise<Response> {
+  if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
   const resource = await statResource(client, absPath);
   if (!resource) return errorResponse('Not Found', 404);
   await client.fileOperation('delete', [{ path: absPath }]);
@@ -380,20 +463,28 @@ async function handleDelete(client: TeraboxClient, absPath: string): Promise<Res
 async function handleMoveCopy(
   request: Request,
   client: TeraboxClient,
-  url: URL,
   srcPath: string,
   method: 'MOVE' | 'COPY',
+  mount: Mount,
 ): Promise<Response> {
   const destinationHeader = request.headers.get('Destination');
   if (!destinationHeader) return errorResponse('Bad Request', 400);
-  let destPath: string;
+  let destDav: string;
   try {
-    destPath = decodePathname(new URL(destinationHeader).pathname);
+    destDav = decodePathname(new URL(destinationHeader).pathname);
   } catch {
     return errorResponse('Bad Request', 400);
   }
-  if (destPath === '/' || destPath === '') return errorResponse('Forbidden', 403);
-  if (destPath.length > 1 && destPath.endsWith('/')) destPath = destPath.slice(0, -1);
+  // The Destination carries the base path like any other URL; a target
+  // outside the mounted surface is not ours to write to.
+  if (mount.base) {
+    if (destDav === mount.base) destDav = '/';
+    else if (destDav.startsWith(mount.base + '/')) destDav = destDav.slice(mount.base.length);
+    else return errorResponse('Not Found', 404);
+  }
+  if (destDav.length > 1 && destDav.endsWith('/')) destDav = destDav.slice(0, -1);
+  const destPath = mount.toTera(destDav);
+  if (mount.isRoot(destPath) || destPath === '') return errorResponse('Forbidden', 403);
 
   const overwrite = (request.headers.get('Overwrite') || 'T').toUpperCase() === 'T';
   const same = joinPath(srcPath) === joinPath(destPath);

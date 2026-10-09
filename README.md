@@ -31,6 +31,8 @@ Create the Worker with these secrets/vars:
 | `TERABOX_DOMAIN` | `https://dm.terabox.com` | optional mirror host (default `www.terabox.com`) — **regional deployments matter**: the upload clusters come from this origin's locateupload |
 | `JSTOKEN` | `a1b2c3...` | optional pre-minted token: `window.jsToken` in the terabox.com console (same as Alist/CLI); skips automatic minting |
 | `MIN_GAP_MS` | `400` | optional rate pacing between Terabox calls (default `400`; bclone parity) |
+| `PATH` | `/dav/` | optional base path the WebDAV is served under (gdrive parity): requests outside it 404, the bare base 301s to `/dav/`, hrefs include it |
+| `ROOT_ID` | `/backup` | optional Terabox folder mounted as the WebDAV root (gdrive parity; Terabox keys folders by path): clients see only that subtree |
 
 ```sh
 wrangler secret put USERS

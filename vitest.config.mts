@@ -29,6 +29,18 @@ export default defineConfig({
 				plugins: [
 					cloudflareTest({
 						main: 'src/index.ts',
+						miniflare: {
+							...compat,
+							bindings: { ...davBindings, PATH: '/dav', ROOT_ID: '/sub' },
+						},
+					}),
+				],
+				test: { name: 'mount', include: ['test/mount.test.ts'] },
+			},
+			{
+				plugins: [
+					cloudflareTest({
+						main: 'src/index.ts',
 						miniflare: { ...compat },
 					}),
 				],
