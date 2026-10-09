@@ -54,6 +54,10 @@ export class MockTerabox {
 	locateServers: string[] | null = null;
 	/** Hosts whose superfile2 answers HTTP 403 error_code 31045 "user not exists". */
 	rejectHosts = new Set<string>();
+	/** Gate direct-download links like the live 400141 "need verify" endpoint:
+	 *  'once' passes requests carrying jsToken (proves the retry remedy),
+	 *  'always' fails every request (proves the mapped error path). */
+	gateDownloads: 'once' | 'always' | undefined;
 
 	constructor() {
 		this.nodes.set('/', { path: '/', name: '', isdir: 1, size: 0, server_mtime: 1704067200, md5: '' });
@@ -153,6 +157,15 @@ export class MockTerabox {
 
 		// Direct download links served by the CDN mock.
 		if (pathname.startsWith('/dl/')) {
+			const gated =
+				this.gateDownloads === 'always' ||
+				(this.gateDownloads === 'once' && !url.searchParams.has('jsToken'));
+			if (gated) {
+				return new Response(JSON.stringify({ request_id: 'mock-gate', errno: 400141, errmsg: 'need verify' }), {
+					status: 200,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
 			const probe = url.searchParams.get('i') === '1';
 			const path = decodeURIComponent(pathname.slice(4));
 			const node = this.nodes.get(path);

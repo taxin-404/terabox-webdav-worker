@@ -162,6 +162,22 @@ describe('GET / HEAD', () => {
 		expect(res.headers.get('Content-Length')).toBe(String(tb.find('/a.txt')!.size));
 		expect((await new Response(res.body).arrayBuffer()).byteLength).toBe(0);
 	});
+
+	it('retries a 400141 dlink gate with jsToken, then streams', async () => {
+		tb.gateDownloads = 'once';
+		const res = await request('/a.txt');
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('the quick brown fox\n');
+	});
+
+	it('maps a persistent dlink gate to 401 and names the host', async () => {
+		tb.gateDownloads = 'always';
+		const res = await request('/a.txt');
+		expect(res.status).toBe(401);
+		const body = await res.text();
+		expect(body).toContain('"errno":400141');
+		expect(body).toContain('dlink@');
+	});
 });
 
 describe('PUT and MKCOL parents', () => {

@@ -17,6 +17,9 @@ const APP_ID = '250528';
 const CHANNEL = 'dubox';
 /** Browser UA the web flow sends on PCS uploads (TeraboxUploaderCLI). */
 const WEB_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:121.0) Gecko/20100101 Firefox/121.0';
+/** Max bytes peeked from a download response to classify stream vs errno
+ *  gate (~100-byte JSON bodies; anything larger is stitched back on-stream). */
+const DOWNLOAD_SNIFF_LIMIT = 8192;
 
 const RETRY_STATUS = new Set([429, 500, 502, 503, 504, 509]);
 const JS_TOKEN_ERRORS = new Set([4000023, 400141, 450016]);
@@ -106,6 +109,48 @@ export function tbPath(path: string): string {
   return path.startsWith('/') ? path : '/' + path;
 }
 
+/** Host of the final hop a download fetch landed on (after redirects). */
+function downloadHost(finalUrl: string, fallback: string): string {
+  for (const candidate of [finalUrl, fallback]) {
+    try {
+      const host = new URL(candidate).hostname;
+      if (host) return host;
+    } catch {
+      /* try the next candidate */
+    }
+  }
+  return 'dlink';
+}
+
+/** Parse a Terabox JSON error body (nonzero errno + request markers).
+ *  Returns null for anything else — including legitimate file content. */
+function errnoBodyFrom(text: string): { errno: number; msg: string } | null {
+  if (!text.trimStart().startsWith('{')) return null;
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof json !== 'object' || json === null) return null;
+  const record = json as Record<string, unknown>;
+  const errno = Number(record.errno);
+  if (!Number.isFinite(errno) || errno === 0) return null;
+  const marked =
+    'request_id' in record ||
+    'request_id_string' in record ||
+    'errmsg' in record ||
+    'error_msg' in record;
+  if (!marked) return null;
+  const msg =
+    typeof record.errmsg === 'string'
+      ? record.errmsg
+      : typeof record.error_msg === 'string'
+        ? record.error_msg
+        : '';
+  return { errno, msg };
+}
+
 export interface ApiOptions {
   method?: string;
   query?: Record<string, string>;
@@ -159,15 +204,6 @@ export class TeraboxClient {
     this.baseUrl = /^https?:\/\//.test(domain) ? domain : 'https://' + domain;
     this.configuredJsToken = (opts.jsToken || '').trim();
     this.minGapMs = typeof opts.minGapMs === 'number' && opts.minGapMs >= 0 ? opts.minGapMs : DEFAULT_MIN_GAP_MS;
-  }
-
-  /** Referer/Cookie pair for streaming Terabox download links. */
-  baseUrlForDownload(): string {
-    return this.baseUrl;
-  }
-
-  cookieForDownload(): string {
-    return this.cookie;
   }
 
   /**
@@ -460,6 +496,151 @@ export class TeraboxClient {
       },
     );
     return json.dlink?.[0]?.dlink || '';
+  }
+
+  /**
+   * Fetch a signed dlink stream. The signed URL still requires the session
+   * Cookie (bare → HTTP 403), and from datacenter IPs the endpoint answers
+   * 400141 "need verify" even with it — the same gate the API remedies with a
+   * jsToken, so retry once with a freshly minted token. An errno-shaped body
+   * must never stream out as file content: it becomes a TeraboxError stamped
+   * with `dlink@<host>` so live failures name the exact host that gated.
+   */
+  async fetchDownload(url: string, range?: string | null): Promise<Response> {
+    let lastError: TeraboxError | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let target = url;
+      if (attempt > 0) {
+        await this.ensureJsToken(true); // fresh account-bound token for the retry
+        if (this.jsToken) {
+          const withToken = new URL(url);
+          withToken.searchParams.set('jsToken', this.jsToken);
+          target = withToken.toString();
+        }
+      }
+      const headers: Record<string, string> = {
+        Referer: this.baseUrl,
+        Cookie: this.cookie,
+        'User-Agent': WEB_USER_AGENT,
+        Accept: '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+      };
+      if (range) headers['Range'] = range;
+
+      await this.pace(); // rate-limit guard before the download stream too
+      let response: Response;
+      try {
+        response = await fetch(target, { headers, redirect: 'follow' });
+      } catch (error) {
+        throw new TeraboxError(
+          -5,
+          `Terabox download network error: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+
+      const host = downloadHost(response.url || target, target);
+      const verdict = await this.classifyDownload(response, host);
+      if (!verdict.error) return verdict.response;
+      if (attempt === 0 && JS_TOKEN_ERRORS.has(verdict.error.errno)) {
+        lastError = verdict.error;
+        continue; // remedy: fresh jsToken, exactly like the API retry
+      }
+      throw verdict.error;
+    }
+    throw lastError ?? new TeraboxError(-5, 'Terabox download failed');
+  }
+
+  /**
+   * Split a dlink response into "stream it" or an errno-shaped TeraboxError.
+   * At most ~8 KiB is ever buffered (gate bodies are ~100 bytes); larger
+   * bodies are classified by peeking, then stitched back onto the live stream
+   * so a legitimate file is never consumed or re-encoded.
+   */
+  private async classifyDownload(
+    response: Response,
+    host: string,
+  ): Promise<{ error?: TeraboxError; response: Response }> {
+    const status = response.status;
+    const contentType = (response.headers.get('Content-Type') || '').toLowerCase();
+    const lengthHeader = response.headers.get('Content-Length');
+    const length = lengthHeader === null ? Number.NaN : Number(lengthHeader);
+    const jsonish = contentType.includes('json');
+    // Sniff JSON bodies (any size, up to the peek limit) plus small non-JSON
+    // ones; never open a reader for a large or unbounded binary stream.
+    const sniffable = jsonish || (Number.isFinite(length) && length <= DOWNLOAD_SNIFF_LIMIT);
+
+    if (status >= 200 && status < 300) {
+      if (!sniffable || !response.body) return { response };
+
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      let overflow = false;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        total += value.byteLength;
+        if (total > DOWNLOAD_SNIFF_LIMIT) {
+          overflow = true;
+          break;
+        }
+      }
+      const buffered = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        buffered.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+
+      if (overflow) {
+        // Too big to be a gate: re-attach the peeked bytes to the live stream.
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(buffered);
+          },
+          async pull(controller) {
+            const { done, value } = await reader.read();
+            if (done) controller.close();
+            else controller.enqueue(value);
+          },
+          cancel(reason) {
+            return reader.cancel(reason);
+          },
+        });
+        return { response: new Response(stream, { status, headers: response.headers }) };
+      }
+
+      const gate = errnoBodyFrom(new TextDecoder().decode(buffered));
+      if (gate) {
+        const error = this.downloadError(gate, host, status, `Terabox download error ${gate.errno}`);
+        return { error, response };
+      }
+      // Legitimate small file (e.g. a real .json): re-wrap the original bytes.
+      return { response: new Response(buffered, { status, headers: response.headers }) };
+    }
+
+    // Non-2xx: 403 WAF pages and gate JSON with an error status.
+    const text = await response.text().catch(() => '');
+    const gate = errnoBodyFrom(text);
+    const errno = gate ? gate.errno : -5;
+    const fallback = errno === -5 ? `Terabox download http error ${status}` : `Terabox download error ${errno}`;
+    const error = this.downloadError({ errno, msg: gate?.msg ?? '' }, host, status, fallback);
+    if (text && !gate) error.upstream = text.slice(0, 300);
+    return { error, response };
+  }
+
+  private downloadError(
+    body: { errno: number; msg: string },
+    host: string,
+    status: number,
+    fallback: string,
+  ): TeraboxError {
+    const error = new TeraboxError(body.errno, this.errorMessage(body.errno, fallback));
+    error.step = `dlink@${host}`;
+    if (body.msg) error.upstream = body.msg;
+    error.httpStatus = status;
+    return error;
   }
 
   async quota(): Promise<{ total: number; used: number; free: number }> {

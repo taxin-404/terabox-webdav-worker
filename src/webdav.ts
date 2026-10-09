@@ -286,19 +286,9 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   });
   if (item.md5) headers.set('ETag', `"${item.md5}"`);
   const range = request.headers.get('Range');
-  const upstreamFetchHeaders: Record<string, string> = {
-    Referer: client.baseUrlForDownload(),
-    Cookie: client.cookieForDownload(),
-  };
-  if (range) {
-    upstreamFetchHeaders['Range'] = range;
-  }
-
-  await client.pace(); // rate-limit guard before the download stream too
-  const upstream = await fetch(downloadUrl, {
-    headers: upstreamFetchHeaders,
-    redirect: 'follow',
-  });
+  // Paced, cookie-authenticated stream fetch: retries a jsToken gate once and
+  // raises an errno-shaped body as TeraboxError instead of streaming it.
+  const upstream = await client.fetchDownload(downloadUrl, range);
   if (!upstream.ok && upstream.status !== 206) {
     return errorResponse('Bad Gateway', 502);
   }
