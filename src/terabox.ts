@@ -553,10 +553,20 @@ export class TeraboxClient {
     // Live-verified 2026-10-09: the account behind dm.terabox.com lives on
     // dm1/dm2/kul-cdata.terabox.com, which d.terabox.com doesn't even know
     // (it answers the c-jp/c1-jp/c2-jp table → error_code 31045 "user not
-    // exists" on every one). So the configured base origin goes FIRST, then
-    // the browser's d.terabox.com, then <prefix>-data.terabox.com.
+    // exists" on every one).
+    // Origin priority: the configured base origin (authoritative, but gated
+    // from datacenter IPs), then the deployment's own data gateways
+    // (<label>-d / <label>-data, bare GETs work from anywhere — the same
+    // pattern as jp-data for the www deployment), then d.terabox.com (www's
+    // gateway → JP table), then <prefix>-data.
+    const label = new URL(this.baseUrl).hostname.split('.')[0] ?? '';
+    const deploymentGateways =
+      label && label !== 'www'
+        ? [`https://${label}-d.terabox.com`, `https://${label}-data.terabox.com`]
+        : [];
     const origins = [
       this.baseUrl,
+      ...deploymentGateways,
       'https://d.terabox.com',
       `https://${this.domainPrefix}-data.terabox.com`,
     ];
