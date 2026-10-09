@@ -1,6 +1,6 @@
 import { SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AUTH, MockTerabox, ORIGIN, installMock } from './helpers';
+import { AUTH, MockTerabox, ORIGIN, UPLOAD_BASE, installMock } from './helpers';
 
 let tb: MockTerabox;
 
@@ -221,6 +221,18 @@ describe('PUT and MKCOL parents', () => {
 		expect(body.errno).toBe(4000023);
 		expect(body.step).toBe('precreate');
 		expect(body.upstream).toBe('simulated verify required');
+	});
+
+	it('fails over to the next candidate server when a cluster answers 403', async () => {
+		// Mirrors the browser: locateupload returns server[] and the upload
+		// walks it until one cluster accepts (31045 "user not exists" = wrong
+		// cluster). The first candidate rejects, the real host works.
+		const good = new URL(UPLOAD_BASE).host;
+		tb.locateServers = ['bad-pcs.example', good];
+		tb.rejectHosts.add('bad-pcs.example');
+		const res = await request('/failover.txt', { method: 'PUT', body: 'via second server' });
+		expect(res.status).toBe(201);
+		expect(new TextDecoder().decode(tb.find('/failover.txt')!.content)).toBe('via second server');
 	});
 });
 

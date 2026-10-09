@@ -59,6 +59,8 @@ export class TeraboxError extends Error {
   step?: string;
   /** Verbatim msg/errmsg from the upstream JSON, when the API provided one. */
   upstream?: string;
+  /** HTTP status of a non-2xx upstream response (drives cluster failover). */
+  httpStatus?: number;
 
   constructor(
     public readonly errno: number,
@@ -130,6 +132,8 @@ export class TeraboxClient {
   private baseUrl: string;
   private jsToken = '';
   private uploadHost: string | null = null;
+  /** Candidate superfile2 hosts from locateupload's server[] list. */
+  private uploadHosts: string[] | null = null;
   private isPremium = false;
   private premiumChecked = false;
   /** Terabox cluster prefix (Url-Domain-Prefix header); drives the
@@ -227,6 +231,7 @@ export class TeraboxClient {
       const snippet = (await response.text().catch(() => '')).slice(0, 300);
       const error = new TeraboxError(-5, `Terabox http error ${response.status}`);
       if (snippet) error.upstream = snippet;
+      error.httpStatus = response.status;
       throw error;
     }
 
@@ -470,24 +475,38 @@ export class TeraboxClient {
   // upload (locate host -> precreate -> chunks -> create)
   // ---------------------------------------------------------------------------
 
-  private async ensureUploadHost(): Promise<string> {
-    if (this.uploadHost) return this.uploadHost;
-    // Upload-host discovery is served by the <prefix>-data.terabox.com
-    // cluster endpoint with a bare GET (Alist's terabox driver proves this
-    // works); calling it on the www origin with session headers answers
-    // 400141 "need verify" from datacenter IPs. (Official docs get the
-    // superfile2 host from /oauth/tokeninfo upload_domain instead —
-    // docs/terabox-openapi.md.)
-    const { json } = await this.request<{ errno?: number; host?: string }>(
-      `/rest/2.0/pcs/file?method=locateupload`,
-      {
-        absoluteUrl: `https://${this.domainPrefix}-data.terabox.com/rest/2.0/pcs/file?method=locateupload`,
-        bare: true,
-      },
-    );
-    if (!json.host) throw es(-5);
-    this.uploadHost = json.host;
-    return this.uploadHost;
+  private async ensureUploadHosts(): Promise<string[]> {
+    // A host that already accepted an upload in this session is listed first.
+    if (this.uploadHost) return [this.uploadHost, ...(this.uploadHosts ?? [])];
+    if (this.uploadHosts) return this.uploadHosts;
+    // The web client asks d.terabox.com (bare GET, withCredentials) and gets
+    // a *candidate list* back: server[] plus a host fallback — it probes each
+    // until one accepts the upload (clusters like c-jp/c1-jp/c2-jp can answer
+    // error_code 31045 "user not exists" for the same account). The
+    // <prefix>-data.terabox.com origin serves the same endpoint and is kept
+    // as a fallback (works from datacenter IPs; the www origin answers
+    // 400141 "need verify"). (Official API instead gets upload_domain from
+    // /oauth/tokeninfo — docs/terabox-openapi.md.)
+    const origins = ['https://d.terabox.com', `https://${this.domainPrefix}-data.terabox.com`];
+    let lastError: unknown;
+    for (const origin of origins) {
+      try {
+        const { json } = await this.request<{ errno?: number; server?: string[]; host?: string }>(
+          '/rest/2.0/pcs/file?method=locateupload',
+          { absoluteUrl: `${origin}/rest/2.0/pcs/file?method=locateupload`, bare: true },
+        );
+        const candidates = [
+          ...(Array.isArray(json.server) ? json.server : []),
+          ...(json.host ? [json.host] : []),
+        ].filter((host, index, all) => Boolean(host) && all.indexOf(host) === index);
+        if (!candidates.length) throw es(-5);
+        this.uploadHosts = candidates;
+        return candidates;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError instanceof Error ? lastError : es(-5);
   }
 
   private async checkPremium(): Promise<void> {
@@ -607,7 +626,7 @@ export class TeraboxClient {
     if (size > limit) throw es(58);
 
     await atStep('jsToken', () => this.ensureJsToken());
-    const host = await atStep('locateupload', () => this.ensureUploadHost());
+    const hosts = await atStep('locateupload', () => this.ensureUploadHosts());
 
     const { uploadId, returnType } = await atStep('precreate', () =>
       this.precreate(absPath, size, mtimeMs),
@@ -627,14 +646,36 @@ export class TeraboxClient {
     }
 
     const chunkMd5s = chunks.map((chunk) => chunk.md5);
-    for (const chunk of chunks) {
-      const uploadedMd5 = await atStep(`chunk${chunk.partSeq}@${host}`, () =>
-        this.uploadChunk(host, absPath, uploadId, chunk.partSeq, chunk.data),
-      );
-      if (uploadedMd5 !== chunk.md5) {
-        throw new TeraboxError(-5, `Uploaded chunk ${chunk.partSeq} md5 mismatch`);
+    // The browser walks locateupload's candidate server list until one
+    // accepts the upload (wrong-cluster hosts answer HTTP 403
+    // error_code 31045 "user not exists"). Mirror that: retry the chunk
+    // sequence on the next candidate; lock onto the first host that works.
+    let uploaded = false;
+    let lastHostError: TeraboxError | undefined;
+    for (let hostIndex = 0; hostIndex < hosts.length; hostIndex += 1) {
+      const host = hosts[hostIndex]!;
+      try {
+        for (const chunk of chunks) {
+          const uploadedMd5 = await atStep(`chunk${chunk.partSeq}@${host}`, () =>
+            this.uploadChunk(host, absPath, uploadId, chunk.partSeq, chunk.data),
+          );
+          if (uploadedMd5 !== chunk.md5) {
+            throw new TeraboxError(-5, `Uploaded chunk ${chunk.partSeq} md5 mismatch`);
+          }
+        }
+        this.uploadHost = host;
+        uploaded = true;
+        break;
+      } catch (error) {
+        const isLastHost = hostIndex === hosts.length - 1;
+        if (error instanceof TeraboxError && error.httpStatus !== undefined && !isLastHost) {
+          lastHostError = error;
+          continue;
+        }
+        throw error;
       }
     }
+    if (!uploaded) throw lastHostError ?? es(-5);
 
     const createdMd5 = await atStep('create', () =>
       this.createFile(absPath, uploadId, size, mtimeMs, chunkMd5s, overwriteMode),

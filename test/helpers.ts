@@ -50,6 +50,10 @@ export class MockTerabox {
 	/** Test knobs: force an endpoint to fail with this errno (0 = healthy). */
 	membershipErrno = 0;
 	precreateErrno = 0;
+	/** Override locateupload's candidate server list (default: [UPLOAD_BASE host]). */
+	locateServers: string[] | null = null;
+	/** Hosts whose superfile2 answers HTTP 403 error_code 31045 "user not exists". */
+	rejectHosts = new Set<string>();
 
 	constructor() {
 		this.nodes.set('/', { path: '/', name: '', isdir: 1, size: 0, server_mtime: 1704067200, md5: '' });
@@ -312,16 +316,23 @@ export class MockTerabox {
 			}
 		}
 
-		// Upload-host discovery: served by the <prefix>-data.terabox.com
-		// cluster with a bare GET (Alist parity). The www origin answers
-		// 400141 "need verify" — mirrors live.
+		// Upload-host discovery: d.terabox.com (the browser's endpoint) or the
+		// <prefix>-data.terabox.com origin, bare GET, returns a candidate
+		// server list. The www origin answers 400141 "need verify" — mirrors
+		// live.
 		if (pathname === '/rest/2.0/pcs/file') {
-			if (!url.hostname.endsWith('-data.terabox.com')) return json({ errno: 400141, msg: 'need verify' });
-			return json({ errno: 0, host: new URL(UPLOAD_BASE).host });
+			const ok = url.hostname === 'd.terabox.com' || url.hostname.endsWith('-data.terabox.com');
+			if (!ok) return json({ errno: 400141, msg: 'need verify' });
+			const fallback = new URL(UPLOAD_BASE).host;
+			const server = this.locateServers ?? [fallback];
+			return json({ errno: 0, server, host: server[server.length - 1] ?? fallback });
 		}
 
-		// Chunk upload against the located host.
+		// Chunk upload against a located host.
 		if (pathname === '/rest/2.0/pcs/superfile2' && method === 'POST') {
+			if (this.rejectHosts.has(url.hostname)) {
+				return json({ error_code: 31045, error_msg: 'user not exists' }, 403);
+			}
 			const uploadId = url.searchParams.get('uploadid') || '';
 			const partseq = Number(url.searchParams.get('partseq') || '0');
 			const form = await this.formDataOf(req, init);
