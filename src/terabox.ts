@@ -99,6 +99,11 @@ export interface ApiOptions {
   contentType?: string;
   /** Do not append app_id/channel/clienttype/jsToken and skip jsToken / host retries. */
   skipCommonParams?: boolean;
+  /** Send nothing but the URL's own query and an Accept header: the
+   *  locateupload cluster endpoint is served bare (Alist parity) and answers
+   *  400141 "need verify" when session headers accompany it from
+   *  datacenter IPs. */
+  bare?: boolean;
   /** The response is not an ErrorAPI shape (chunk upload); skip errno handling. */
   skipErrorRetry?: boolean;
   /** Return the JSON even when the top-level errno is non-zero, so the caller
@@ -122,6 +127,9 @@ export class TeraboxClient {
   private uploadHost: string | null = null;
   private isPremium = false;
   private premiumChecked = false;
+  /** Terabox cluster prefix (Url-Domain-Prefix header); drives the
+   *  <prefix>-data.terabox.com host used for upload-host discovery. */
+  private domainPrefix = 'jp';
 
   constructor(cookie: string, domain = DEFAULT_BASE_URL) {
     this.cookie = valuedCookie(cookie);
@@ -158,25 +166,26 @@ export class TeraboxClient {
   ): Promise<ApiResult<T>> {
     const url = new URL(opts.absoluteUrl || this.baseUrl + path);
 
-    if (!opts.skipCommonParams) {
+    if (!opts.bare && !opts.skipCommonParams) {
       url.searchParams.set('app_id', APP_ID);
       url.searchParams.set('channel', CHANNEL);
       url.searchParams.set('clienttype', '0');
     }
     // The jsToken is account-bound auth (see ensureJsToken): send it on every
-    // API call once minted, even when the other common params are skipped —
-    // locateupload answers 400141 "verification required" without it.
-    if (this.jsToken) url.searchParams.set('jsToken', this.jsToken);
+    // API call once minted, even when the other common params are skipped.
+    if (this.jsToken && !opts.bare) url.searchParams.set('jsToken', this.jsToken);
     for (const [key, value] of Object.entries(opts.query || {})) {
       url.searchParams.set(key, value);
     }
 
     const headers: Record<string, string> = {
       Accept: 'application/json, text/plain, */*',
-      Referer: this.baseUrl,
-      'X-Requested-With': 'XMLHttpRequest',
-      Cookie: this.cookie,
     };
+    if (!opts.bare) {
+      headers['Referer'] = this.baseUrl;
+      headers['X-Requested-With'] = 'XMLHttpRequest';
+      headers['Cookie'] = this.cookie;
+    }
     let body: BodyInit | undefined;
     if (opts.form instanceof FormData) {
       body = opts.form;
@@ -200,6 +209,9 @@ export class TeraboxClient {
       await this.sleep(attempt * 1000);
       return this.request<T>(path, opts, attempt + 1, jsTokenTried);
     }
+    // Follow Terabox's cluster hint for the *-data upload-host endpoint.
+    const domainPrefix = response.headers.get('Url-Domain-Prefix');
+    if (domainPrefix) this.domainPrefix = domainPrefix;
     if (response.status < 200 || response.status > 299) {
       throw new TeraboxError(-5, `Terabox http error ${response.status}`);
     }
@@ -446,14 +458,18 @@ export class TeraboxClient {
 
   private async ensureUploadHost(): Promise<string> {
     if (this.uploadHost) return this.uploadHost;
-    // Unlike bclone (which sends no common params here), the live API answers
-    // 400141 "verification required" for locateupload from Cloudflare egress
-    // without the full app_id/channel/clienttype/jsToken set — send it like
-    // every other endpoint. (Official docs: superfile2's host normally comes
-    // from /oauth/tokeninfo upload_domain; locateupload is the web-flow
-    // equivalent — docs/terabox-openapi.md.)
+    // Upload-host discovery is served by the <prefix>-data.terabox.com
+    // cluster endpoint with a bare GET (Alist's terabox driver proves this
+    // works); calling it on the www origin with session headers answers
+    // 400141 "need verify" from datacenter IPs. (Official docs get the
+    // superfile2 host from /oauth/tokeninfo upload_domain instead —
+    // docs/terabox-openapi.md.)
     const { json } = await this.request<{ errno?: number; host?: string }>(
-      '/rest/2.0/pcs/file?method=locateupload',
+      `/rest/2.0/pcs/file?method=locateupload`,
+      {
+        absoluteUrl: `https://${this.domainPrefix}-data.terabox.com/rest/2.0/pcs/file?method=locateupload`,
+        bare: true,
+      },
     );
     if (!json.host) throw es(-5);
     this.uploadHost = json.host;

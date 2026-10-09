@@ -310,12 +310,14 @@ export class MockTerabox {
 				if (this.membershipErrno) return json({ errno: this.membershipErrno });
 				return json({ errno: 0, data: { member_info: { is_vip: 0 } } });
 			}
-			if (pathname === '/rest/2.0/pcs/file') {
-				// Mirrors live: upload-host discovery answers 400141
-				// ("verification required") without the account-bound jsToken.
-				if (!url.searchParams.get('jsToken')) return json({ errno: 400141 });
-				return json({ errno: 0, host: new URL(UPLOAD_BASE).host });
-			}
+		}
+
+		// Upload-host discovery: served by the <prefix>-data.terabox.com
+		// cluster with a bare GET (Alist parity). The www origin answers
+		// 400141 "need verify" — mirrors live.
+		if (pathname === '/rest/2.0/pcs/file') {
+			if (!url.hostname.endsWith('-data.terabox.com')) return json({ errno: 400141, msg: 'need verify' });
+			return json({ errno: 0, host: new URL(UPLOAD_BASE).host });
 		}
 
 		// Chunk upload against the located host.
