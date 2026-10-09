@@ -10,3 +10,6 @@ enabled = true
 
 # Terabox session cookie. Full cookie string or bare "ndus" value.
 # vars = { COOKIE = "ndus=...; lang=en" }
+
+# Optional alternate Terabox mirror host (defaults to https://www.terabox.com).
+# vars = { TERABOX_DOMAIN = "https://www.terabox.com" }

@@ -9,6 +9,7 @@ import {
   MAX_FREE_FILE_BYTES,
   MAX_PREMIUM_FILE_BYTES,
 } from './sign';
+import { md5Hex } from './md5';
 import type { TeraboxItem } from './types';
 
 const DEFAULT_BASE_URL = 'https://www.terabox.com';
@@ -77,7 +78,7 @@ export function tbPath(path: string): string {
 export interface ApiOptions {
   method?: string;
   query?: Record<string, string>;
-  form?: Record<string, string>;
+  form?: FormData | Record<string, string>;
   body?: string;
   contentType?: string;
   /** Do not append app_id/channel/clienttype/jsToken and skip jsToken / host retries. */
@@ -154,7 +155,9 @@ export class TeraboxClient {
       Cookie: this.cookie,
     };
     let body: BodyInit | undefined;
-    if (opts.form) {
+    if (opts.form instanceof FormData) {
+      body = opts.form;
+    } else if (opts.form) {
       const form = new FormData();
       for (const [key, value] of Object.entries(opts.form)) form.set(key, value);
       body = form;
@@ -444,7 +447,7 @@ export class TeraboxClient {
           partseq: String(partSeq),
           uploadsign: '0',
         },
-        body: undefined,
+        form,
         skipErrorRetry: true,
       },
     );
@@ -544,15 +547,4 @@ export interface OperationalItem {
   dest?: string;
   newname?: string;
   ondup?: string;
-}
-
-/** Lowercase hex md5 of a byte array (Terabox chunk checksums). */
-async function md5Hex(data: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    'MD5',
-    data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as BufferSource,
-  );
-  return Array.from(new Uint8Array(digest))
-    .map((byte) => byte.toString(16).padStart(2, '0'))
-    .join('');
 }

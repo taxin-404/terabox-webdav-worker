@@ -63,8 +63,9 @@ export function xmlEscape(value: string): string {
 
 /** WebDAV href (URL-encoded, trailing slash for collections). */
 export function encodeHref(path: string, isDir: boolean): string {
-  const segments = String(path || '/').split('/').filter(Boolean).map(encodeURIComponent).join('/');
-  return '/' + segments + (isDir ? '/' : '');
+  const segments = String(path || '/').split('/').filter(Boolean).map(encodeURIComponent);
+  if (segments.length === 0) return isDir ? '/' : '';
+  return '/' + segments.join('/') + (isDir ? '/' : '');
 }
 
 /** Decode a request pathname into a cleaned absolute path. */
@@ -290,7 +291,6 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
     Cookie: client.cookieForDownload(),
   };
   if (range) {
-    headers.set('Range', range);
     upstreamFetchHeaders['Range'] = range;
   }
 
