@@ -15,6 +15,8 @@ import type { TeraboxItem } from './types';
 const DEFAULT_BASE_URL = 'https://www.terabox.com';
 const APP_ID = '250528';
 const CHANNEL = 'dubox';
+/** Browser UA the web flow sends on PCS uploads (TeraboxUploaderCLI). */
+const WEB_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:121.0) Gecko/20100101 Firefox/121.0';
 
 const RETRY_STATUS = new Set([429, 500, 502, 503, 504, 509]);
 const JS_TOKEN_ERRORS = new Set([4000023, 400141, 450016]);
@@ -112,6 +114,9 @@ export interface ApiOptions {
   raw?: boolean;
   /** Absolute URL override (chunk upload host). */
   absoluteUrl?: string;
+  /** Extra request headers merged over the defaults (Origin/Referer/UA for
+   *  the PCS cluster, which checks them). */
+  headers?: Record<string, string>;
 }
 
 interface ApiResult<T> {
@@ -172,8 +177,11 @@ export class TeraboxClient {
       url.searchParams.set('clienttype', '0');
     }
     // The jsToken is account-bound auth (see ensureJsToken): send it on every
-    // API call once minted, even when the other common params are skipped.
-    if (this.jsToken && !opts.bare) url.searchParams.set('jsToken', this.jsToken);
+    // API call once minted — except bare and skipCommonParams requests; all
+    // working clients omit it from the superfile2 chunk upload.
+    if (this.jsToken && !opts.bare && !opts.skipCommonParams) {
+      url.searchParams.set('jsToken', this.jsToken);
+    }
     for (const [key, value] of Object.entries(opts.query || {})) {
       url.searchParams.set(key, value);
     }
@@ -186,6 +194,7 @@ export class TeraboxClient {
       headers['X-Requested-With'] = 'XMLHttpRequest';
       headers['Cookie'] = this.cookie;
     }
+    if (opts.headers) Object.assign(headers, opts.headers);
     let body: BodyInit | undefined;
     if (opts.form instanceof FormData) {
       body = opts.form;
@@ -526,18 +535,35 @@ export class TeraboxClient {
     data: Uint8Array,
   ): Promise<string> {
     const form = new FormData();
-    form.set('file', new Blob([data as unknown as BufferSource], { type: 'application/octet-stream' }), 'blob');
+    const fileName = splitPath(absPath).base || 'blob';
+    form.set('file', new Blob([data as unknown as BufferSource], { type: 'application/octet-stream' }), fileName);
+    // Identity on the PCS cluster comes from the session Cookie. Neither
+    // working client (Alist, TeraboxUploaderCLI) sends jsToken here — the
+    // superfile2 call failed with error_code 31045 "user not exists" while
+    // ours did. Send the union of their proven parameters instead: web/type
+    // flags (Alist / CLI) plus browser Origin, Referer and User-Agent (CLI).
     const { json } = await this.request<{ errno?: number; md5?: string }>(
       `/rest/2.0/pcs/superfile2`,
       {
         method: 'POST',
         absoluteUrl: `https://${host}/rest/2.0/pcs/superfile2`,
+        skipCommonParams: true, // no jsToken; the common params are listed below
         query: {
           method: 'upload',
+          type: 'tmpfile',
+          web: '1',
+          app_id: APP_ID,
+          channel: CHANNEL,
+          clienttype: '0',
           path: tbPath(absPath),
           uploadid: uploadId,
           partseq: String(partSeq),
           uploadsign: '0',
+        },
+        headers: {
+          Origin: this.baseUrl,
+          Referer: `${this.baseUrl}/main?category=all`,
+          'User-Agent': WEB_USER_AGENT,
         },
         form,
         skipErrorRetry: true,
