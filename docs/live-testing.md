@@ -158,13 +158,63 @@ Also confirmed live:
 - download speed from the user's PC: ~29 KB/s direct vs 2.5 Mbps via JP VPN
   (TH→KL peering); the Worker's Cloudflare egress is unaffected by this
 
+### GET gate root cause found (2026-10-09) — fixed by the PCS route (`2e6ce6b`)
+
+Everything about the `/file/<hash>` dlink hop was measured from both IPs:
+
+| probe | residential | Cloudflare (datacenter) |
+|---|---|---|
+| filemetas dlink + cookie | 302 → CDN | **400141 "need verify"** |
+| filemetas `origin=dlna` (Alist crack) | 302 → CDN | same hop, same gate |
+| official `/api/download` dlink (`token=…&chkv=1`) | 302 → CDN | same hop, same gate |
+| rewritten host (`dm-d` → `dm.terabox.com`, the web app's own `formatDownloadURL` rule) | 302 → CDN | **still 400141** — `/file/` gates DC IPs on every origin |
+| CDN (`kul-ddata`) capability URL, **no cookie** | 200 bytes | (never reached) |
+
+- Fresh `jsToken` does not clear it → IP-reputation gate (Themis — the
+  `by=themis` param is minted into the Location), not a session defect.
+- The web app's JS has no workaround for this gate either (its `400141`
+  mapping is share-code/login only); it never sees the gate because
+  browsers run on residential IPs.
+- `403`/`31045 "user not exists"` on a bare dlink = session-scoped sign.
+
+**The fix — the app protocol never touches `/file/`:**
+
+```
+GET https://dm-d.terabox.com/rest/2.0/pcs/file?method=download&app_id=250528&path=<path>
+Cookie: <session>
+→ 302 Location: https://kul-ddata.terabox.com/file/…   (no jsToken, no sign)
+```
+
+Mobile/desktop apps download through this route; it is the same
+`/rest/2.0/pcs/file` family as `locateupload`, live-proven reachable from
+Cloudflare (that is how uploads work now). The CDN Location needs no
+cookie at all.
+
+Download ladder (lazy — each phase only runs if the previous failed):
+
+1. **PCS** `method=download` on `<label>-d` → `<label>-data` → origin
+   (www deployments: origin → `d.terabox.com`) — no minting, one call.
+2. **official** `/api/download` token dlink (minted via home/info+sign).
+3. **plain** filemetas `dlink=1` link.
+All gated → the last `400141` is rethrown (`step: dlink@<host>`, 401).
+
+Also in this cut: `fetchDownload` follows the CDN 302 **by hand**
+(`redirect: 'manual'` + explicit Location hop — Alist `NoRedirectClient`
+parity): the session cookie never leaves the API origin, and `Range`
+rides across the hop so ranged GETs keep working. `errnoBodyFrom`
+recognises the PCS `error_code` JSON shape as well as web `errno`, so a
+gate body can never stream out as file content. Mock gained the PCS
+route (302 → `/dl/?via=pcs`), per-flavour gating `gateDl: ['plain' |
+'official' | 'pcs']` and the `gatePcs` knob — 53/53 tests.
+
 ### Status / open work
 
-1. **Apply to the Cloudflare dashboard**: `COOKIE` = full string
-   (ndus+stoken+BAIDUID+lang), `TERABOX_DOMAIN` = `https://dm.terabox.com`;
-   then retest PUT + GET live. `JSTOKEN` optional (dm's `/main` serves a
-   session-bound token; the value first pasted by the user was actually
-   `stoken` — re-copy from the console if setting it).
+1. Live-verify GET through the new ladder (pcs route) from Cloudflare:
+   round-trip PUT→GET, Range, HEAD; then mark this file's campaign log
+   with the result.
+2. Confirm `COOKIE` on the dashboard is a **Secret** (it was originally
+   entered as Text; secrets survive deploys, plain-text vars don't —
+   `wrangler.toml` `[vars]` now owns `TERABOX_DOMAIN`/`MIN_GAP_MS`).
 3. Fix Range/206 passthrough and HEAD `Content-Length` (#3, #4).
 4. Re-run `test/live/webdav-livetest.sh` and update this file.
 
