@@ -257,7 +257,7 @@ export class MockTerabox {
 				await form?.get('path');
 				const uploadId = 'upload-' + Math.random().toString(36).slice(2);
 				this.uploads.set(uploadId, new Map());
-				return json({ errno: 0, uploadid: uploadId, return_type: 0 });
+				return json({ errno: 0, uploadid: uploadId, return_type: 0, uploadsign: 'mock-sign' });
 			}
 			if (pathname === '/api/filemanager' && method === 'POST') {
 				const raw = await req.arrayBuffer();
@@ -331,6 +331,12 @@ export class MockTerabox {
 		// Chunk upload against a located host.
 		if (pathname === '/rest/2.0/pcs/superfile2' && method === 'POST') {
 			if (this.rejectHosts.has(url.hostname)) {
+				return json({ error_code: 31045, error_msg: 'user not exists' }, 403);
+			}
+			// The web client always echoes precreate's uploadsign back
+			// (e.uploadSign = o.uploadsign) — lock that contract here; live
+			// clusters reject mismatches with 31045 "user not exists".
+			if (url.searchParams.get('uploadsign') !== 'mock-sign') {
 				return json({ error_code: 31045, error_msg: 'user not exists' }, 403);
 			}
 			const uploadId = url.searchParams.get('uploadid') || '';

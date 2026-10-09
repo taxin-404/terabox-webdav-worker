@@ -601,31 +601,44 @@ export class TeraboxClient {
     }
   }
 
-  private async precreate(absPath: string, size: number, mtimeMs: number): Promise<{ uploadId: string; returnType: number }> {
+  private async precreate(
+    absPath: string,
+    size: number,
+    mtimeMs: number,
+  ): Promise<{ uploadId: string; returnType: number; uploadSign: string }> {
     const chunkSize = getChunkSize(size, this.isPremium);
     const dir = splitPath(absPath).dir;
-    const { json } = await this.request<{ errno?: number; uploadid?: string; return_type?: number }>(
-      '/api/precreate',
-      {
-        method: 'POST',
-        form: {
-          path: tbPath(absPath),
-          autoinit: '1',
-          local_mtime: String(Math.floor(mtimeMs / 1000)),
-          file_limit_switch_v34: 'true',
-          size: String(size),
-          target_path: dir,
-          block_list: placeholderBlockList(size, chunkSize),
-        },
+    const { json } = await this.request<{
+      errno?: number;
+      uploadid?: string;
+      return_type?: number;
+      uploadsign?: string | number;
+    }>('/api/precreate', {
+      method: 'POST',
+      form: {
+        path: tbPath(absPath),
+        autoinit: '1',
+        local_mtime: String(Math.floor(mtimeMs / 1000)),
+        file_limit_switch_v34: 'true',
+        size: String(size),
+        target_path: dir,
+        block_list: placeholderBlockList(size, chunkSize),
       },
-    );
-    return { uploadId: json.uploadid || '', returnType: json.return_type || 0 };
+    });
+    // The web client forwards precreate's uploadsign to superfile2 and
+    // create (e.uploadSign = o.uploadsign) — never hardcodes 0.
+    return {
+      uploadId: json.uploadid || '',
+      returnType: json.return_type || 0,
+      uploadSign: String(json.uploadsign ?? 0),
+    };
   }
 
   private async uploadChunk(
     host: string,
     absPath: string,
     uploadId: string,
+    uploadSign: string,
     partSeq: number,
     data: Uint8Array,
   ): Promise<string> {
@@ -654,8 +667,8 @@ export class TeraboxClient {
           clienttype: '0',
           path: tbPath(absPath),
           uploadid: uploadId,
+          uploadsign: uploadSign,
           partseq: String(partSeq),
-          uploadsign: '0',
         },
         headers: {
           Origin: this.baseUrl,
@@ -672,6 +685,7 @@ export class TeraboxClient {
   private async createFile(
     absPath: string,
     uploadId: string,
+    uploadSign: string,
     size: number,
     mtimeMs: number,
     blockList: string[],
@@ -686,6 +700,7 @@ export class TeraboxClient {
         path: tbPath(absPath),
         local_mtime: String(Math.floor(mtimeMs / 1000)),
         uploadid: uploadId,
+        uploadsign: uploadSign,
         size: String(size),
         target_path: dir,
         block_list: JSON.stringify(blockList),
@@ -706,7 +721,7 @@ export class TeraboxClient {
     await atStep('jsToken', () => this.ensureJsToken());
     const hosts = await atStep('locateupload', () => this.ensureUploadHosts());
 
-    const { uploadId, returnType } = await atStep('precreate', () =>
+    const { uploadId, returnType, uploadSign } = await atStep('precreate', () =>
       this.precreate(absPath, size, mtimeMs),
     );
     if (returnType === 2) throw es(-8);
@@ -735,7 +750,7 @@ export class TeraboxClient {
       try {
         for (const chunk of chunks) {
           const uploadedMd5 = await atStep(`chunk${chunk.partSeq}@${host}`, () =>
-            this.uploadChunk(host, absPath, uploadId, chunk.partSeq, chunk.data),
+            this.uploadChunk(host, absPath, uploadId, uploadSign, chunk.partSeq, chunk.data),
           );
           if (uploadedMd5 !== chunk.md5) {
             throw new TeraboxError(-5, `Uploaded chunk ${chunk.partSeq} md5 mismatch`);
@@ -756,7 +771,7 @@ export class TeraboxClient {
     if (!uploaded) throw lastHostError ?? es(-5);
 
     const createdMd5 = await atStep('create', () =>
-      this.createFile(absPath, uploadId, size, mtimeMs, chunkMd5s, overwriteMode),
+      this.createFile(absPath, uploadId, uploadSign, size, mtimeMs, chunkMd5s, overwriteMode),
     );
 
     const controlMd5 =
