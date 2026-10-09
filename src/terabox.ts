@@ -740,12 +740,19 @@ export class TeraboxClient {
     // copy is submitted async; move/rename/delete report a task id otherwise.
     await this.ensureJsToken();
 
-    const payload = items.map((item) => ({
-      path: tbPath(String(item.path || '')),
-      ...(item.dest !== undefined ? { dest: tbPath(item.dest) } : {}),
-      ...(item.newname !== undefined ? { newname: item.newname } : {}),
-      ...(item.ondup !== undefined ? { ondup: item.ondup } : {}),
-    }));
+    // Wire contract differs per opera (bclone apiOperation parity):
+    //   delete: filelist ["/path"]        — a plain array of path strings;
+    //          objects make the server NPE with an empty HTTP 500.
+    //   move/rename/copy: [{"path":…,"dest":…,"newname":…}]
+    const payload =
+      opera === 'delete'
+        ? items.map((item) => tbPath(String(item.path || '')))
+        : items.map((item) => ({
+            path: tbPath(String(item.path || '')),
+            ...(item.dest !== undefined ? { dest: tbPath(item.dest) } : {}),
+            ...(item.newname !== undefined ? { newname: item.newname } : {}),
+            ...(item.ondup !== undefined ? { ondup: item.ondup } : {}),
+          }));
 
     const jsonList = JSON.stringify(payload);
     const body = `filelist=${encodeURIComponent(jsonList)}`;

@@ -292,18 +292,20 @@ export class MockTerabox {
 			if (pathname === '/api/filemanager' && method === 'POST') {
 				const raw = await req.arrayBuffer();
 				const body = new TextDecoder().decode(raw);
-				const filelist = JSON.parse(new URLSearchParams(body).get('filelist') || '[]') as Array<{
-					path?: string;
-					dest?: string;
-					newname?: string;
-					ondup?: string;
-				}>;
+				const filelist = JSON.parse(new URLSearchParams(body).get('filelist') || '[]') as Array<
+					string | { path?: string; dest?: string; newname?: string; ondup?: string }
+				>;
 				const opera = url.searchParams.get('opera');
+				// Live contract (bclone parity): delete takes a plain array of
+				// path strings; objects NPE the server into an empty HTTP 500.
+				if (opera === 'delete' && !filelist.every((item) => typeof item === 'string')) {
+					return new Response('', { status: 500 });
+				}
 				const info: Array<{ errno: number; path?: string }> = [];
 				for (const item of filelist) {
-					const src = item.path || '';
+					const src = (typeof item === 'string' ? item : item.path) || '';
 					const node = this.nodes.get(src);
-					const overwrite = item.ondup === 'overwrite';
+					const overwrite = typeof item !== 'string' && item.ondup === 'overwrite';
 					if (opera === 'delete') {
 						if (!node) {
 							info.push({ errno: -9 });
@@ -311,6 +313,11 @@ export class MockTerabox {
 						}
 						this.removeTree(src);
 						info.push({ errno: 0 });
+						continue;
+					}
+					// Non-delete operas always use the object form.
+					if (typeof item === 'string') {
+						info.push({ errno: -9 });
 						continue;
 					}
 					if (!node) {
