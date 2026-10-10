@@ -309,14 +309,17 @@ not a guess.
 **65/65 on four suites; locks is limited only by Cloudflare isolate
 scheduling.** Lock records and dead props are per-isolate in-memory state
 (this worker has no storage binding). A sequential litmus connection usually
-stays on one warm isolate (run 3: 31/33), but every now and then one request
-of the session lands on a different isolate — the observed failures are
-symmetric artifacts of exactly that (`notowner_lock`: LOCK saw an empty store
-→ `200` instead of `423`; `lock_shared`: LOCK saw a stale store → `423`
-instead of `200`). Real clients are never harmed by the hopping: an empty
-store *allows* writes (only enforcement relaxes), and lenient tokens cover
-UNLOCK. Making locks 100 % deterministic under Cloudflare scheduling requires
-a Durable Object (dashboard resource + binding; noted as the upgrade path in
+stays on one warm isolate, but occasionally a single request of the session
+lands on a different isolate — and since each run reuses leftover state, the
+artifacts cascade (one hop can poison a later test on the original isolate).
+Five measured runs: full suite 31/33 and 35/38; locks-only reruns 39/40,
+23/25, 38/40 — i.e. **~1–2 random misses per run, never the same test twice**
+(e.g. `lock_excl` itself saw a stale record once and answered `423` instead
+of `200`), and no ordering that a protocol-logic bug could produce. Real
+clients are never harmed by the hopping: an empty store *allows* writes
+(only enforcement relaxes), and lenient tokens cover UNLOCK. Making locks
+100 % deterministic under Cloudflare scheduling requires a Durable Object
+(dashboard resource + binding; noted as the upgrade path in
 `terabox-limits.md` §6).
 
 ### Verification tooling
