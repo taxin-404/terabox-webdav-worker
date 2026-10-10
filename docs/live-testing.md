@@ -429,11 +429,13 @@ and large-file reads through the mount "hung forever".
 ### davfs2 behaviour: the "hang" is a design property, not a wedge
 
 > Follow-up deep dive (full strace, per-window byte accounting, request-record
-> forensics): the1.1 GB re-open hangs turned out to be **repeated whole-file
-> re-downloads**, one of them restarting from zero after a CDN stall tripped
-> davfs2's 180 s read timeout — plus an etag-capture quirk that can lock a
-> davfs2 client into bare-GET revalidations forever. Full evidence, the
-> designed fix, and handoff recipes:
+> forensics, then a connected `wrangler tail` + `journalctl` third pass): the
+> 1.1 GB re-open "hangs" were **repeated whole-file re-downloads caused by
+> davfs2's client-side `cache_size` default (50 MiB)** purging the large file's
+> own cache entry while it was still open — every later open then restarted
+> from zero. Root cause observed on the wire, fix is config
+> (`cache_size` above the largest file), plus RFC 7233 hardening shipped
+> separately. Full evidence and write-up:
 > `docs/davfs2-etag-hang-investigation.md`.
 
 Established from the davfs2 source (Debian sid tree) plus a full `strace -f`
@@ -469,7 +471,8 @@ of the live daemon during a mount read:
   parser (`read_secrets`/`parse_line`) does **not** split `user:pass` on a
   colon — such a line parses as username-only and triggers the interactive
   password prompt (EOF → SIGABRT when no tty).
-- Defaults worth tuning for a snappy mount: `buf_size 64` (16),
+- Defaults worth tuning for a snappy mount: `cache_size 2048` (50 — **mandatory
+  above the largest file**, see below), `buf_size 64` (16),
   `delay_upload 0` (10), `gui_optimize 1` (0), `use_locks 0` (1).
 
 ### Live session results (through the mount)
@@ -484,7 +487,53 @@ of the live daemon during a mount read:
 - `wrangler tail` proved flaky this session (two sessions captured
   zero bytes); the daemon-side `strace` was the reliable channel.
 
+### Root cause closed: davfs2 `cache_size` purge (2026-10-10, third pass)
+
+The large-file re-download loop (the "hang" above) was pinned to the **client,
+not the worker**, by three direct observations:
+
+- **`wrangler tail --format json`** (reconnected, backgrounded with stderr
+  captured) observed the worker answering **`status: 200` + ETag** to the
+  daemon's no-Range GETs — never a `206`. The daemon's bare requests were bare
+  because a *purged cache file* sends the next open down davfs2's
+  **fresh-download branch** (`cache.c:2696-2706`), which passes a local `NULL`
+  etag by design — no `If-None-Match`, full body, from zero. No bad status
+  was ever involved.
+- **`journalctl -g 'max cache size'`** showed **ten purges** that day, each
+  shortly before a fresh full-download episode; the strace caught one live:
+  the daemon's own syslog line `open files exceed max cache size by 1025
+  MiBytes`, then `unlink()` of **every** cached file within 15 ms — including
+  the still-downloading large file's own entry (the open fd keeps the
+  unlinked inode alive, so the in-flight download "completes" into a file
+  that no longer exists).
+- **Arithmetic pins the limit to the default**: file 1074.5 MiB − 1025 MiB
+  over = **49.6 MiB ≈ the built-in `cache_size 50`** (the `/etc` conf ships
+  that line commented out; nothing on the box set it).
+
+Complete loop: open large file → whole-file `GET` into cache → tidy deletes it
+(limit 50 MiB) → next open finds no cache file → fresh branch → bare full
+`GET` → repeat, forever. Small files (< 50 MiB) kept their cache entries,
+which is why they always revalidated (`304`, zero bytes) and masked the bug.
+
+**Fix (config, no code):** `~/.davfs2/davfs2.conf` sets `cache_size 2048`
+(MiB). **Verification recipe** (needs a remount to take effect): mount as the
+user (the fstab entry reads `~/.davfs2/davfs2.conf`; a *root* mount reads the
+`/etc` file instead), open the big file once (one final full download), then
+re-open → expect an instant open, **zero** cache-write `write(6,…)` calls in
+the daemon trace, and a quiet `journalctl -g 'max cache size'`.
+
+The 206/etag footgun chased in the earlier passes is real (source-verified: a
+successful non-`200` frees davfs2's stored etag) and is fixed on this branch
+as RFC 7233 §4.1 conformance hardening — defence-in-depth, not this
+incident's cause. Full write-up: `docs/davfs2-etag-hang-investigation.md`.
+
 ## Repo map (context for AI sessions)
+
+Branch state (2026-10-10): `main` = production (auto-deploys on push; litmus
+105/105, 142 unit tests). `fix/davfs2-etag-hang` = the RFC 7233 GET/ETag
+conformance hardening + this root-cause write-up (pending review — gates
+green, not yet merged/deployed). Gates before any push to `main`:
+`npm run typecheck && npm test -- --run && npx wrangler deploy --dry-run`.
 
 - `taxin-404/terabox-webdav-worker` — this project (TypeScript Worker)
 - `BenjiThatFoxGuy/bclone` — rclone fork; the Terabox backend ported here
