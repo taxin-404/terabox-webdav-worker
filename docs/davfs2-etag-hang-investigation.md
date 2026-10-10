@@ -3,7 +3,7 @@
 Status: **root cause observed on the wire (2026-10-10, third pass) — it is a
 davfs2 client-side `cache_size` purge, not a worker fault.** The 206/etag
 mechanism this document originally pursued is a *real* latent robustness bug
-(fixed on `main` since `35eb401`, deployed) but was **not** the cause of the observed
+(fixed on `main` since `d065d53`, deployed) but was **not** the cause of the observed
 re-download loop. Originally written 2026-10-10 as a handoff; a second pass
 re-verified every load-bearing davfs2 claim against the Debian master sources;
 a third pass closed the last link with a connected `wrangler tail`, the
@@ -41,7 +41,7 @@ source-verified** davfs2 footgun (a successful non-`200` GET frees the stored
 etag, `webdav.c:818-838`) and our old `webdav.ts` could in principle surface an
 unrequested `206` from the PCS upstream. But `wrangler tail --format json`
 directly observed the worker answering **`200`** to the daemon's GETs, so that
-path was **not** what looped here. It is fixed on `main` (merged `35eb401`,
+path was **not** what looped here. It is fixed on `main` (merged `d065d53`,
 deployed) as RFC 7233 §4.1 conformance hardening and defence-in-depth, not as
 the root cause. See "Root cause (resolved)".
 
@@ -294,7 +294,7 @@ The mount re-open check is still the right way to verify the *config* fix.
    instantly. If it does, the loop is confirmed as "one bad status poisons the
    client forever" and the fix below is exactly right.
 
-## Conformance hardening (on production since `35eb401`) — not the root-cause fix
+## Conformance hardening (on production since `d065d53`) — not the root-cause fix
 
 The root-cause fix is the `cache_size` config change above. Separately, the
 merged change hardens the worker against the *latent* 206/etag footgun (a real RFC
@@ -330,7 +330,7 @@ was not what looped here). Worth shipping as defence-in-depth and correctness:
    ```
 
    Result on the branch: typecheck clean, 142/142 tests, dry-run bundles.
-   Pre-fix differential: reverting `src/webdav.ts` to `a36c847` fails **4 of
+   Pre-fix differential: reverting `src/webdav.ts` to `80860a1` fails **4 of
    the 6** new tests (the unrequested-206 normalization, the truncated-206
    ladder fall-through, the all-truncated 502, the md5-less etag fallback);
    the remaining 2 are regression guards for behaviour that already worked
@@ -371,9 +371,9 @@ was not what looped here). Worth shipping as defence-in-depth and correctness:
 
 ## Related session work (already merged)
 
-- `99e589a` — literal `+` in path segments (this very file's name exposed it);
+- `440f809` — literal `+` in path segments (this very file's name exposed it);
   lockdiscovery `Math.ceil`.
-- `17c7b12` —60 s read-path metadata cache (first PROPFIND of a fresh path
+- `d9d4ea9` —60 s read-path metadata cache (first PROPFIND of a fresh path
   482 ms → 105 ms).
-- `b556c30` — README davfs2 usage section + Campaign 5 log in
+- `51e0dea` — README davfs2 usage section + Campaign 5 log in
   `docs/live-testing.md`.

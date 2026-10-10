@@ -158,7 +158,7 @@ Also confirmed live:
 - download speed from the user's PC: ~29 KB/s direct vs 2.5 Mbps via JP VPN
   (TH→KL peering); the Worker's Cloudflare egress is unaffected by this
 
-### GET gate root cause found (2026-10-09) — fixed by the PCS route (`2e6ce6b`)
+### GET gate root cause found (2026-10-09) — fixed by the PCS route (`bb58ba2`)
 
 Everything about the `/file/<hash>` dlink hop was measured from both IPs:
 
@@ -221,7 +221,7 @@ route (302 → `/dl/?via=pcs`), per-flavour gating `gateDl: ['plain' |
 | DELETE 4 test folders (recursive) | 204 ×4, account left clean |
 | PROPFIND Depth 1 | 207, ~0.6 s |
 
-### DELETE contract found (bclone parity, `988f122`)
+### DELETE contract found (bclone parity, `6490bac`)
 
 Live DELETE answered an **empty HTTP 500** from `/api/filemanager` while
 MOVE on the same endpoint worked. bclone's `apiOperation` documents the
@@ -268,7 +268,7 @@ not a guess.
 | locks | 25/38 | `notowner_*` (enforcement missing), `cond_put*`, `discover` … |
 | http | **3/3** | — |
 
-### Fixes shipped (`563441c`, `03d1901`)
+### Fixes shipped (`f7e66c8`, `af43e24`)
 
 1. **Parent-collection rules (RFC 4918 §9.3.1/§9.7.1/§9.9.3)** — MKCOL, PUT
    and MOVE/COPY targets now require an existing parent collection (`409`).
@@ -319,7 +319,7 @@ of `200`), and no ordering that a protocol-logic bug could produce. Real
 clients are never harmed by the hopping: an empty store *allows* writes
 (only enforcement relaxes), and lenient tokens cover UNLOCK. Making locks
 100 % deterministic under Cloudflare scheduling requires a Durable Object —
-**done in Campaign 4 below** (`28249d5`).
+**done in Campaign 4 below** (`f2302d3`).
 
 ### Verification tooling
 
@@ -358,7 +358,7 @@ state lived in per-isolate memory, so the occasional litmus request that
 Cloudflare routed to a different isolate saw a stale or empty store
 (~1–2 random misses per run, never the same test twice).
 
-### Implementation (`28249d5`)
+### Implementation (`f2302d3`)
 
 - New `src/davstate.ts`: a `DavStore` interface with two implementations
   backed by **one set of pure core functions** (semantics cannot drift):
@@ -409,16 +409,16 @@ and large-file reads through the mount "hung forever".
 
 ### Fixes shipped
 
-- `99e589a` — `decodePathname` applied form-encoding (`+` → space) to URL
+- `440f809` — `decodePathname` applied form-encoding (`+` → space) to URL
   *path* segments; a literal `+` in a file name (e.g. `Hindi 5.1+English
   5.1...mkv`) broke lookup for every client that sends it raw (davfs2,
   browsers). Now plain `decodeURIComponent` per RFC 3986 (drive-worker
   parity). Live-verified after deploy: raw-`+` GET 404→206, PROPFIND 404→207.
   Five regression tests (raw `+`, `%2B`, `%20`, PROPFIND hrefs, MOVE).
-- `99e589a` — lockdiscovery used `Math.floor` of the remaining ms, so a
+- `440f809` — lockdiscovery used `Math.floor` of the remaining ms, so a
   fresh `Second-3600` lock intermittently rendered `Second-3599` (observed
   2/5 runs); `Math.ceil` makes it deterministic (130/130 ×3).
-- `17c7b12` — read-path metadata cache (Google Drive worker parity, 60 s
+- `d9d4ea9` — read-path metadata cache (Google Drive worker parity, 60 s
   TTL). Every read paid a paced `filemetas` round-trip (~0.7-0.9 s of the
   ~2.4 s measured per request), and davfs2 stats paths constantly. The
   dlink-flavoured fill is shared by `statResource` and `handleGet`; writes
@@ -525,16 +525,22 @@ the daemon trace, and a quiet `journalctl -g 'max cache size'`.
 
 The 206/etag footgun chased in the earlier passes is real (source-verified: a
 successful non-`200` frees davfs2's stored etag) and is fixed on `main`
-since `35eb401` as RFC 7233 §4.1 conformance hardening — defence-in-depth, not this
+since `d065d53` as RFC 7233 §4.1 conformance hardening — defence-in-depth, not this
 incident's cause. Full write-up: `docs/davfs2-etag-hang-investigation.md`.
 
 ## Repo map (context for AI sessions)
 
-Branch state (2026-10-10): `main` = production, auto-deploys on push (litmus
-105/105, 142 unit tests); it includes the RFC 7233 GET/ETag conformance
-hardening (merged `35eb401`, deployed) and this root-cause write-up.
-`fix/davfs2-etag-hang` is merged and can be deleted. Gates before any push to
-`main`: `npm run typecheck && npm test -- --run && npx wrangler deploy --dry-run`.
+Branch state (2026-10-10, post-audit): `main` = production, auto-deploys on
+push (litmus 105/105, 173 unit tests). It includes the RFC 7233 GET/ETag
+conformance hardening (merged `d065d53`, deployed) and the full-repo audit
+hardening (merged `4d87f47`: traversal containment, metaCache cap, errno→status
+maps, DO-backed lock/prop tests, docs/config fixes — see the Phase 2–4 commit
+messages). All feature branches (`fix/davfs2-etag-hang`, `fix/audit-hardening`,
+`docs/ndus-cookie-lifetime`, `docs/openapi-full-extraction`) are merged and
+deleted; only `main` remains. Git history was rewritten (filter-repo) to purge
+leaked credentials — pre-rewrite SHAs in old sessions map via the subjects.
+Gates before any push to `main`: `npm run review` (typecheck + tests +
+dry-run deploy).
 
 - `taxin-404/terabox-webdav-worker` — this project (TypeScript Worker)
 - `BenjiThatFoxGuy/bclone` — rclone fork; the Terabox backend ported here
