@@ -16,6 +16,25 @@ enabled = true
 TERABOX_DOMAIN = "https://dm.terabox.com"
 MIN_GAP_MS = "400"
 
+# Advisory WebDAV state (locks + dead props) for the WHOLE account lives in
+# one Durable Object: every isolate talks to the same serialized instance,
+# so Cloudflare's isolate scheduling can no longer make lock enforcement
+# flaky. Class `DavState` is exported from src/index.ts (via src/davstate.ts)
+# and was pre-created in the dashboard (namespace `dav-state`); the worker
+# falls back to per-isolate memory state if the binding is ever removed.
+[[durable_objects.bindings]]
+name = "DAV_STATE"
+class_name = "DavState"
+
+# The class already exists (created in the dashboard: namespace `dav-state`,
+# SQLite), so it is declared as a live export rather than via a migration —
+# `new_sqlite_classes` would try to create it again and the server would
+# reject the duplicate. If the class is ever deleted, drop this [exports]
+# block and add a [[migrations]] tag with `new_sqlite_classes = ["DavState"]`.
+[exports.DavState]
+type = "durable-object"
+storage = "sqlite"
+
 # Optional base path the WebDAV surface is served under (gdrive parity),
 # e.g. serve only below /dav/ — requests outside it 404:
 # vars = { PATH = "/dav/" }

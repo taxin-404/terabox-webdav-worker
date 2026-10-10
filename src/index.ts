@@ -1,6 +1,12 @@
 import { TeraboxClient, TeraboxError, errIsNum } from './terabox';
 import { errorResponse, handleWebDav } from './webdav';
+import { createDavStore, DavState } from './davstate';
 import type { Env } from './types';
+
+// The Durable Object holding advisory WebDAV state (locks + dead props).
+// Must be re-exported from the main bundle for the runtime to resolve the
+// `DAV_STATE` binding's class_name.
+export { DavState };
 
 interface Credential {
   username: string;
@@ -107,7 +113,12 @@ const worker: ExportedHandler<Env> = {
     const started = Date.now();
     log('info', `${request.method} ${url.pathname}`);
     try {
-      const response = await handleWebDav(request, client, { basePath: env.PATH, rootId: env.ROOT_ID });
+      const response = await handleWebDav(
+        request,
+        client,
+        { basePath: env.PATH, rootId: env.ROOT_ID },
+        createDavStore(env),
+      );
       const elapsed = Date.now() - started;
       if (elapsed > 500) log('info', `slow ${request.method} ${url.pathname} (${elapsed}ms)`);
       return response;

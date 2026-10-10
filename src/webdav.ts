@@ -6,7 +6,20 @@ import {
   validateXml,
   type PropElement,
 } from './davxml';
+import {
+  collectTokens,
+  createDavStore,
+  resetDavVolatileState,
+  type DavStore,
+  type LockRecord,
+  type PathState,
+  type PropPatchOp,
+  type TokenCheck,
+} from './davstate';
 import type { Dentry, TeraboxItem } from './types';
+
+export { resetDavVolatileState };
+export type { LockRecord };
 
 export const DAV_NS = 'DAV:';
 
@@ -191,99 +204,11 @@ async function statResource(client: TeraboxClient, absPath: string): Promise<Den
   }
 }
 
-/**
- * Per-isolate advisory state: real (in-memory) lock records and dead
- * properties. Sequential conformance clients such as litmus keep hitting
- * the same warm isolate, so this is enough to enforce and discover locks
- * and to store dead props; after isolate rotation the state is simply
- * gone — which only relaxes enforcement, never corrupts the account.
- * Self-issued tokens embed their expiry so a warm client's token stays
- * honoured across rotation (see isOurUnexpiredToken).
+/*
+ * Advisory state (lock records + dead properties) lives in ./davstate behind
+ * the DavStore interface — Durable Object when bound, per-isolate memory
+ * otherwise. The HTTP layer below only ever talks to a DavStore.
  */
-interface LockRecord {
-  token: string;
-  scope: 'exclusive' | 'shared';
-  /** RFC 4918 depth: "0" or "Infinity". */
-  depth: string;
-  /** Inner XML of the request's <owner> element. */
-  owner: string;
-  expiresAt: number;
-}
-
-const LOCKS = new Map<string, LockRecord[]>();
-const DEAD_PROPS = new Map<string, Map<string, string>>();
-
-/** Test hook: clear per-isolate advisory state between test cases. */
-export function resetDavVolatileState(): void {
-  LOCKS.clear();
-  DEAD_PROPS.clear();
-}
-
-function purgeLocksAt(path: string): LockRecord[] {
-  const records = LOCKS.get(path);
-  if (!records) return [];
-  const now = Date.now();
-  const live = records.filter((r) => r.expiresAt > now);
-  if (live.length > 0) LOCKS.set(path, live);
-  else LOCKS.delete(path);
-  return live;
-}
-
-/** Locks on the path itself, plus Infinity-depth locks on its ancestors. */
-function applyingLocks(path: string): LockRecord[] {
-  const now = Date.now();
-  const out: LockRecord[] = [];
-  for (const [lockedPath, records] of LOCKS) {
-    for (const rec of records) {
-      if (rec.expiresAt <= now) continue;
-      if (
-        lockedPath === path ||
-        (rec.depth === 'Infinity' && path.startsWith(lockedPath + '/'))
-      ) {
-        out.push(rec);
-      }
-    }
-  }
-  return out;
-}
-
-function isOurUnexpiredToken(token: string): boolean {
-  const m = /^opaquelocktoken:[0-9a-fA-F-]{36}:(\d{13,})$/.exec(token);
-  return m !== null && Number(m[1]) > Date.now();
-}
-
-function makeLockToken(seconds: number): string {
-  return `opaquelocktoken:${crypto.randomUUID()}:${Date.now() + seconds * 1000}`;
-}
-
-function collectTokens(header: string | null): string[] {
-  if (!header) return [];
-  const tokens: string[] = [];
-  for (const m of header.matchAll(/<([^<>\s]+)>/g)) {
-    if (m[1] !== undefined) tokens.push(m[1]);
-  }
-  return tokens;
-}
-
-function tokenApplies(token: string, path: string): boolean {
-  for (const rec of applyingLocks(path)) {
-    if (rec.token === token) return true;
-  }
-  // A self-issued token whose embedded expiry has not passed still counts:
-  // the record behind it may have been lost to isolate rotation, and
-  // blocking a warm client's writes until it re-locks would be worse than
-  // honouring the token it was given.
-  return isOurUnexpiredToken(token);
-}
-
-/** RFC 4918 §6: writing a locked resource without its token is 423. */
-function enforceLocks(request: Request, path: string): Response | null {
-  const locks = applyingLocks(path);
-  if (locks.length === 0) return null;
-  const presented = collectTokens(request.headers.get('If'));
-  if (locks.some((r) => presented.includes(r.token))) return null;
-  return errorResponse('Locked', 423);
-}
 
 interface IfTerm {
   negated: boolean;
@@ -321,13 +246,18 @@ function parseIfHeader(header: string): IfTerm[][] | null {
 async function checkMutationPreconditions(
   request: Request,
   client: TeraboxClient,
+  store: DavStore,
   path: string,
   opts?: { enforce?: boolean },
 ): Promise<Response | null> {
   const ifHeader = request.headers.get('If');
+  const presented = collectTokens(ifHeader);
+  let check: TokenCheck | null = null;
   if (ifHeader) {
     const lists = parseIfHeader(ifHeader);
     if (!lists) return errorResponse('Bad Request', 400);
+    check = await store.checkTokens(path, presented);
+    const applies = new Set(check.applies);
     let anyTrue = false;
     const invalidTokens = new Set<string>();
     let etag: string | null | undefined;
@@ -336,7 +266,7 @@ async function checkMutationPreconditions(
       for (const term of terms) {
         let value: boolean;
         if (term.kind === 'token') {
-          value = tokenApplies(term.value, path);
+          value = applies.has(term.value);
           if (!term.negated && !value) invalidTokens.add(term.value);
         } else {
           if (etag === undefined) {
@@ -360,13 +290,31 @@ async function checkMutationPreconditions(
       const lockShaped = [...invalidTokens].some(
         (t) => t.startsWith('opaquelocktoken:') || t.startsWith('urn:uuid:'),
       );
-      return lockShaped && applyingLocks(path).length > 0
+      return lockShaped && check.applying > 0
         ? errorResponse('Locked', 423)
         : errorResponse('Precondition Failed', 412);
     }
     if (!anyTrue) return errorResponse('Precondition Failed', 412);
   }
-  return opts?.enforce === false ? null : enforceLocks(request, path);
+  if (opts?.enforce === false) return null;
+  // RFC 4918 §6: writing a locked resource without its token is 423.
+  const effective = check ?? (await store.checkTokens(path, presented));
+  if (effective.applying === 0) return null;
+  if (effective.recordTokens.some((t) => presented.includes(t))) return null;
+  return errorResponse('Locked', 423);
+}
+
+/** Lock enforcement alone (for methods without If-semantics, e.g. MKCOL). */
+async function enforceWrite(
+  request: Request,
+  store: DavStore,
+  path: string,
+): Promise<Response | null> {
+  const presented = collectTokens(request.headers.get('If'));
+  const check = await store.checkTokens(path, presented);
+  if (check.applying === 0) return null;
+  if (check.recordTokens.some((t) => presented.includes(t))) return null;
+  return errorResponse('Locked', 423);
 }
 
 function activelockXml(rec: LockRecord): string {
@@ -383,49 +331,9 @@ function activelockXml(rec: LockRecord): string {
   );
 }
 
-function lockdiscoveryMarkup(path: string): string {
-  const records = purgeLocksAt(path);
-  if (records.length === 0) return '<D:lockdiscovery/>';
-  return `<D:lockdiscovery>${records.map(activelockXml).join('')}</D:lockdiscovery>`;
-}
-
-/** Drop advisory state for a removed path (and below it, for collections). */
-function forgetAdvisory(path: string, recursive: boolean): void {
-  DEAD_PROPS.delete(path);
-  LOCKS.delete(path);
-  if (!recursive) return;
-  for (const key of [...DEAD_PROPS.keys()]) {
-    if (key.startsWith(path + '/')) DEAD_PROPS.delete(key);
-  }
-  for (const key of [...LOCKS.keys()]) {
-    if (key.startsWith(path + '/')) LOCKS.delete(key);
-  }
-}
-
-/** Move (or copy) advisory state along with the resource. */
-function rekeyAdvisory<T>(
-  store: Map<string, T>,
-  src: string,
-  dest: string,
-  mode: 'move' | 'copy',
-  recursive: boolean,
-): void {
-  const relocated: Array<[string, T]> = [];
-  if (store.has(src)) relocated.push([dest, store.get(src)!]);
-  if (recursive) {
-    for (const [key, value] of store) {
-      if (key.startsWith(src + '/')) relocated.push([dest + key.slice(src.length), value]);
-    }
-  }
-  if (mode === 'move') {
-    store.delete(src);
-    if (recursive) {
-      for (const key of [...store.keys()]) {
-        if (key.startsWith(src + '/')) store.delete(key);
-      }
-    }
-  }
-  for (const [key, value] of relocated) store.set(key, value);
+function lockdiscoveryMarkup(locks: LockRecord[]): string {
+  if (locks.length === 0) return '<D:lockdiscovery/>';
+  return `<D:lockdiscovery>${locks.map(activelockXml).join('')}</D:lockdiscovery>`;
 }
 
 /** Advisory-lock support advertised in `supportedlock` (gdrive parity). */
@@ -512,7 +420,12 @@ function deadNameElement(key: string): string {
   return `<X:${local} xmlns:X="${xmlEscape(ns)}"/>`;
 }
 
-function multistatus(resource: DavResource, children: DavResource[], query: PropQuery): Response {
+function multistatus(
+  resource: DavResource,
+  children: DavResource[],
+  query: PropQuery,
+  states: Record<string, PathState>,
+): Response {
   const parts: string[] = [];
   parts.push(`<?xml version="1.0" encoding="utf-8"?>`);
   parts.push(`<D:multistatus xmlns:D="${DAV_NS}">`);
@@ -520,14 +433,16 @@ function multistatus(resource: DavResource, children: DavResource[], query: Prop
   const emit = (r: DavResource) => {
     parts.push(`<D:response>`);
     parts.push(`<D:href>${xmlEscape(r.href)}</D:href>`);
-    const dead = DEAD_PROPS.get(r.absPath);
+    const state = states[r.absPath];
+    const locks = state?.locks ?? [];
+    const dead = state?.props;
 
     if (query.kind === 'all') {
       parts.push(`<D:propstat>`);
       parts.push(`<D:prop>`);
       for (const name of ALLPROP_ORDER) parts.push(STATIC_PROPS[name]?.(r) ?? '');
-      parts.push(lockdiscoveryMarkup(r.absPath));
-      if (dead) for (const markup of dead.values()) parts.push(markup);
+      parts.push(lockdiscoveryMarkup(locks));
+      if (dead) for (const markup of Object.values(dead)) parts.push(markup);
       parts.push(`</D:prop>`);
       parts.push(`<D:status>HTTP/1.1 200 OK</D:status>`);
       parts.push(`</D:propstat>`);
@@ -536,7 +451,7 @@ function multistatus(resource: DavResource, children: DavResource[], query: Prop
       parts.push(`<D:prop>`);
       for (const name of ALLPROP_ORDER) parts.push(`<D:${name}/>`);
       parts.push(`<D:lockdiscovery/>`);
-      if (dead) for (const key of dead.keys()) parts.push(deadNameElement(key));
+      if (dead) for (const key of Object.keys(dead)) parts.push(deadNameElement(key));
       parts.push(`</D:prop>`);
       parts.push(`<D:status>HTTP/1.1 200 OK</D:status>`);
       parts.push(`</D:propstat>`);
@@ -545,7 +460,7 @@ function multistatus(resource: DavResource, children: DavResource[], query: Prop
       const missing: string[] = [];
       for (const el of query.requested) {
         if (el.key === `{${DAV_NS}}lockdiscovery`) {
-          ok.push(lockdiscoveryMarkup(r.absPath));
+          ok.push(lockdiscoveryMarkup(locks));
           continue;
         }
         const build = el.key.startsWith(`{${DAV_NS}}`) ? STATIC_PROPS[el.local] : undefined;
@@ -553,7 +468,7 @@ function multistatus(resource: DavResource, children: DavResource[], query: Prop
           ok.push(build(r));
           continue;
         }
-        const stored = dead?.get(el.key);
+        const stored = dead?.[el.key];
         if (stored !== undefined) {
           ok.push(stored);
           continue;
@@ -602,6 +517,7 @@ export async function handleWebDav(
   request: Request,
   client: TeraboxClient,
   opts?: { basePath?: string; rootId?: string },
+  store: DavStore = createDavStore({}),
 ): Promise<Response> {
   const mount = makeMount(opts);
   const url = new URL(request.url);
@@ -642,33 +558,33 @@ export async function handleWebDav(
       });
 
     case 'PROPFIND':
-      return handlePropfind(request, client, absPath, mount);
+      return handlePropfind(request, client, store, absPath, mount);
 
     case 'PROPPATCH':
-      return handleProppatch(request, client, absPath, mount);
+      return handleProppatch(request, client, store, absPath, mount);
 
     case 'LOCK':
-      return handleLock(request, client, absPath, mount);
+      return handleLock(request, client, store, absPath, mount);
 
     case 'UNLOCK':
-      return handleUnlock(request, absPath);
+      return handleUnlock(request, store, absPath);
 
     case 'MKCOL':
-      return handleMkcol(request, client, absPath, mount);
+      return handleMkcol(request, client, store, absPath, mount);
 
     case 'GET':
     case 'HEAD':
       return handleGet(request, client, absPath, method === 'HEAD');
 
     case 'PUT':
-      return handlePut(request, client, absPath, mount);
+      return handlePut(request, client, store, absPath, mount);
 
     case 'DELETE':
-      return handleDelete(request, client, absPath, mount);
+      return handleDelete(request, client, store, absPath, mount);
 
     case 'MOVE':
     case 'COPY':
-      return handleMoveCopy(request, client, absPath, method, mount);
+      return handleMoveCopy(request, client, store, absPath, method, mount);
 
     default:
       return errorResponse('Method Not Allowed', 405);
@@ -678,6 +594,7 @@ export async function handleWebDav(
 async function handlePropfind(
   request: Request,
   client: TeraboxClient,
+  store: DavStore,
   absPath: string,
   mount: Mount,
 ): Promise<Response> {
@@ -695,16 +612,19 @@ async function handlePropfind(
 
   const href = encodeHref(mount.href(absPath), resource.isDir);
   if (depth === '0') {
-    return multistatus({ ...resource, href, absPath }, [], query);
+    const states = await store.describe([absPath]);
+    return multistatus({ ...resource, href, absPath }, [], query, states);
   }
 
   // Depth "1" and anything else (infinity/missing) → children only.
   if (absPath !== '/' && !resource.isDir) {
-    return multistatus({ ...resource, href, absPath }, [], query);
+    const states = await store.describe([absPath]);
+    return multistatus({ ...resource, href, absPath }, [], query, states);
   }
   if (absPath === '/' && !resource.isDir) {
     // Should not happen: the root is always a collection.
-    return multistatus({ ...resource, href, absPath }, [], query);
+    const states = await store.describe([absPath]);
+    return multistatus({ ...resource, href, absPath }, [], query, states);
   }
 
   let children: DavResource[] = [];
@@ -726,12 +646,15 @@ async function handlePropfind(
     throw error;
   }
 
-  return multistatus({ ...resource, href, isDir: true, absPath }, children, query);
+  // One store round-trip covers locks + dead props for the whole listing.
+  const states = await store.describe([absPath, ...children.map((c) => c.absPath)]);
+  return multistatus({ ...resource, href, isDir: true, absPath }, children, query, states);
 }
 
 async function handleMkcol(
   request: Request,
   client: TeraboxClient,
+  store: DavStore,
   absPath: string,
   mount: Mount,
 ): Promise<Response> {
@@ -751,7 +674,7 @@ async function handleMkcol(
   // RFC 4918 §9.3.1: an intermediate collection must already exist (409).
   const parentCheck = await requireParent(client, absPath);
   if (parentCheck) return parentCheck;
-  const locked = enforceLocks(request, absPath);
+  const locked = await enforceWrite(request, store, absPath);
   if (locked) return locked;
   try {
     await client.mkdir(absPath);
@@ -909,10 +832,16 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   throw lastError;
 }
 
-async function handlePut(request: Request, client: TeraboxClient, absPath: string, mount: Mount): Promise<Response> {
+async function handlePut(
+  request: Request,
+  client: TeraboxClient,
+  store: DavStore,
+  absPath: string,
+  mount: Mount,
+): Promise<Response> {
   if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
 
-  const pre = await checkMutationPreconditions(request, client, absPath);
+  const pre = await checkMutationPreconditions(request, client, store, absPath);
   if (pre) return pre;
 
   // RFC 4918 §9.7.1: creation needs existing intermediate collections (409).
@@ -951,22 +880,24 @@ async function handlePut(request: Request, client: TeraboxClient, absPath: strin
 async function handleDelete(
   request: Request,
   client: TeraboxClient,
+  store: DavStore,
   absPath: string,
   mount: Mount,
 ): Promise<Response> {
   if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
   const resource = await statResource(client, absPath);
   if (!resource) return errorResponse('Not Found', 404);
-  const pre = await checkMutationPreconditions(request, client, absPath);
+  const pre = await checkMutationPreconditions(request, client, store, absPath);
   if (pre) return pre;
   await client.fileOperation('delete', [{ path: absPath }]);
-  forgetAdvisory(absPath, resource.isDir);
+  await store.relocate([{ src: absPath, mode: 'forget', recursive: resource.isDir }]);
   return new Response(null, { status: 204 });
 }
 
 async function handleMoveCopy(
   request: Request,
   client: TeraboxClient,
+  store: DavStore,
   srcPath: string,
   method: 'MOVE' | 'COPY',
   mount: Mount,
@@ -1012,13 +943,13 @@ async function handleMoveCopy(
   // source blocks MOVE but never COPY — copying a locked resource without
   // its token is fine (litmus locks/copy), overwriting a locked target is
   // not, so the destination is enforced separately for both methods.
-  const pre = await checkMutationPreconditions(request, client, srcPath, {
+  const pre = await checkMutationPreconditions(request, client, store, srcPath, {
     enforce: method === 'MOVE',
   });
   if (pre) return pre;
 
   const destResource = await statResource(client, destPath);
-  const destLock = enforceLocks(request, destPath);
+  const destLock = await enforceWrite(request, store, destPath);
   if (destLock) return destLock;
   if (destResource && !overwrite) return errorResponse('Precondition Failed', 412);
 
@@ -1033,7 +964,7 @@ async function handleMoveCopy(
     // therefore clears the target first — if the move then fails, the old
     // node is recoverable from the recycle bin, never destroyed.
     await client.fileOperation('delete', [{ path: destPath }]);
-    forgetAdvisory(destPath, destResource.isDir);
+    await store.relocate([{ src: destPath, mode: 'forget', recursive: destResource.isDir }]);
   }
 
   const recursive = srcResource.isDir;
@@ -1042,7 +973,7 @@ async function handleMoveCopy(
     // Depth: 0 on a collection: only the (empty) collection is created,
     // never its members (litmus copy_shallow).
     await client.mkdir(destPath);
-    rekeyAdvisory(DEAD_PROPS, srcPath, destPath, 'copy', false);
+    await store.relocate([{ src: srcPath, dest: destPath, mode: 'copy', recursive: false }]);
     return new Response(null, { status: destResource && overwrite ? 204 : 201 });
   }
 
@@ -1055,22 +986,31 @@ async function handleMoveCopy(
     },
   ]);
 
-  rekeyAdvisory(DEAD_PROPS, srcPath, destPath, method === 'MOVE' ? 'move' : 'copy', recursive);
-  // Locks move with the resource on MOVE; a COPY never carries locks.
-  if (method === 'MOVE') rekeyAdvisory(LOCKS, srcPath, destPath, 'move', recursive);
+  await store.relocate([
+    {
+      src: srcPath,
+      dest: destPath,
+      mode: method === 'MOVE' ? 'move' : 'copy',
+      // Locks move with the resource on MOVE; a COPY never carries locks.
+      withLocks: method === 'MOVE',
+      recursive,
+    },
+  ]);
 
   return new Response(null, { status: destResource && overwrite ? 204 : 201 });
 }
 
 /**
- * LOCK: real (per-isolate) lock records. Refreshes extend the matched
- * record — including a refresh aimed at a child of an Infinity-locked
- * collection; an already-locked resource rejects non-owners with 423;
- * a shared lock only stacks on other shared locks.
+ * LOCK: real lock records in the state store (Durable Object when bound —
+ * one serialized instance for the whole account, so every isolate agrees).
+ * Refreshes extend the matched record, including a refresh aimed at a child
+ * of an Infinity-locked collection; an already-locked resource rejects
+ * non-owners with 423; a shared lock only stacks on other shared locks.
  */
 async function handleLock(
   request: Request,
   client: TeraboxClient,
+  store: DavStore,
   absPath: string,
   mount: Mount,
 ): Promise<Response> {
@@ -1094,43 +1034,16 @@ async function handleLock(
   const owner = ownerBlock?.[1] ?? '';
   const depth = (request.headers.get('Depth') || '').toLowerCase() === '0' ? '0' : 'Infinity';
 
-  const presented = collectTokens(request.headers.get('If'));
-  const now = Date.now();
-
-  // Refresh: the presented token matches a lock on this resource or on an
-  // Infinity-depth ancestor (litmus indirect_refresh) — extend it in place.
-  const refreshable = applyingLocks(absPath).find((r) => presented.includes(r.token));
-  if (refreshable) {
-    refreshable.expiresAt = now + seconds * 1000;
-    return lockResponse(refreshable, 200);
-  }
-
-  const existing = purgeLocksAt(absPath);
-  if (existing.length > 0) {
-    // Already locked and not the owner: an exclusive lock admits nothing
-    // else, and a shared lock admits only further shared requests
-    // (RFC 4918 §9.10.6).
-    if (!shared || existing.some((r) => r.scope === 'exclusive')) {
-      return errorResponse('Locked', 423);
-    }
-  }
-
-  // Re-acquire the client's own still-valid token when its record was lost
-  // to isolate rotation; any other presented token is ignored and a fresh
-  // one minted.
-  const token = presented.find(isOurUnexpiredToken) ?? makeLockToken(seconds);
-  const record: LockRecord = {
-    token,
-    scope: shared ? 'shared' : 'exclusive',
+  const outcome = await store.lockAcquire(absPath, {
+    shared,
     depth,
     owner,
-    expiresAt: now + seconds * 1000,
-  };
-  const records = LOCKS.get(absPath) ?? [];
-  records.push(record);
-  LOCKS.set(absPath, records);
+    presented: collectTokens(request.headers.get('If')),
+    seconds,
+  });
+  if (!outcome.ok) return errorResponse('Locked', 423);
 
-  return lockResponse(record, resource ? 200 : 201);
+  return lockResponse(outcome.record, outcome.refreshed || resource ? 200 : 201);
 }
 
 function lockResponse(rec: LockRecord, status: number): Response {
@@ -1148,33 +1061,30 @@ function lockResponse(rec: LockRecord, status: number): Response {
 }
 
 /** UNLOCK removes exactly the token named in Lock-Token (RFC 4918 §9.11). */
-function handleUnlock(request: Request, absPath: string): Response {
+async function handleUnlock(request: Request, store: DavStore, absPath: string): Promise<Response> {
   const header = request.headers.get('Lock-Token') || '';
   const token = header.match(/<([^<>\s]+)>/)?.[1];
   if (!token) return errorResponse('Bad Request', 400);
-  const records = purgeLocksAt(absPath);
-  const index = records.findIndex((r) => r.token === token);
-  if (index === -1) {
-    // A self-issued token whose record is gone (isolate rotation) means the
-    // lock has already lapsed: succeeding is the graceful answer. Anything
-    // else — a foreign or forged token — is a 409 per RFC 4918 §9.11.
-    if (isOurUnexpiredToken(token)) return new Response(null, { status: 204 });
+  const outcome = await store.unlock(absPath, token);
+  // 'lapsed' = our own still-valid token with no record left (rotation):
+  // the lock is gone, so succeeding is the graceful answer. 'nomatch' —
+  // a foreign or forged token — is a 409 per RFC 4918 §9.11.
+  if (outcome === 'nomatch') {
     return errorResponse('Lock Token Does Not Match Any Lock on this Resource', 409);
   }
-  records.splice(index, 1);
-  if (records.length > 0) LOCKS.set(absPath, records);
-  else LOCKS.delete(absPath);
   return new Response(null, { status: 204 });
 }
 
 /**
- * PROPPATCH: sets/removes are applied to the per-isolate dead-prop store
- * and echoed in a well-formed 207; PROPFIND then serves the stored values
- * (litmus propget). DAV live props are never patchable (403 propstat).
+ * PROPPATCH: sets/removes are applied to the dead-prop store (Durable
+ * Object when bound) and echoed in a well-formed 207; PROPFIND then serves
+ * the stored values (litmus propget). DAV live props are never patchable
+ * (403 propstat).
  */
 async function handleProppatch(
   request: Request,
   client: TeraboxClient,
+  store: DavStore,
   absPath: string,
   mount: Mount,
 ): Promise<Response> {
@@ -1185,11 +1095,11 @@ async function handleProppatch(
   }
   const resource = await statResource(client, absPath);
   if (!resource) return errorResponse('Not Found', 404);
-  const pre = await checkMutationPreconditions(request, client, absPath);
+  const pre = await checkMutationPreconditions(request, client, store, absPath);
   if (pre) return pre;
 
   const scope = collectXmlScope(body);
-  const store = DEAD_PROPS.get(absPath) ?? new Map<string, string>();
+  const ops: PropPatchOp[] = [];
   const propstats: string[] = [];
   const opRe = /<(?:[A-Za-z_][\w.-]*:)?(set|remove)(?:\s[^>]*)?>/g;
   let om: RegExpExecArray | null;
@@ -1216,8 +1126,7 @@ async function handleProppatch(
         live.push(el.markup);
         continue;
       }
-      if (op === 'set') store.set(el.key, el.markup);
-      else store.delete(el.key);
+      ops.push({ op: op === 'set' ? 'set' : 'remove', key: el.key, markup: el.markup });
     }
     if (live.length > 0) {
       propstats.push(
@@ -1233,8 +1142,7 @@ async function handleProppatch(
       );
     }
   }
-  if (store.size > 0) DEAD_PROPS.set(absPath, store);
-  else DEAD_PROPS.delete(absPath);
+  if (ops.length > 0) await store.propPatch(absPath, ops);
   if (propstats.length === 0) {
     propstats.push(`<D:propstat><D:prop/><D:status>HTTP/1.1 200 OK</D:status></D:propstat>`);
   }

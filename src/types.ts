@@ -22,6 +22,10 @@ export interface Env {
   ROOT_ID?: string;
   // Optional per-request log tag.
   LOG_PREFIX?: string;
+  // Durable Object holding advisory WebDAV state (locks + dead props) for
+  // the whole account. When absent the worker falls back to per-isolate
+  // in-memory state (enforcement then relaxes across isolate hops).
+  DAV_STATE?: DurableObjectNamespace;
 }
 
 /** Raw item shape returned by Terabox list/filemeta endpoints. */
