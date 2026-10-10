@@ -131,11 +131,22 @@ davfs2's access pattern shapes how the mount feels:
 - **`~/.davfs2/davfs2.conf`** reduces chatter:
 
   ```
+  cache_size 2048   # MiB — CRITICAL, see the warning below
   delay_upload 0    # default 10: write back on close, not 10 s later
   gui_optimize 1    # one PROPFIND per directory instead of per-file stats
   use_locks 0       # skip advisory LOCK round-trips
   buf_size 64       # 16: larger kernel read/write buffer
   ```
+
+  > **`cache_size` is not optional if you open large files.** davfs2's built-in
+  > default is **50 MiB**. While a file bigger than that is open (downloading),
+  > the cache tidy enforces the limit by deleting *every* cached file — including
+  > the large file's own cache entry. The next open then finds nothing to
+  > revalidate and restarts the whole download from zero, forever (each restart
+  > logs `open files exceed max cache size by N MiBytes` to the journal). Set
+  > `cache_size` above your largest file. Full root-cause write-up:
+  > `docs/davfs2-etag-hang-investigation.md`. Small files (< `cache_size`) are
+  > unaffected and revalidate with `304` as described above.
 
 - **`lost+found/`** in the mount view is a davfs2 built-in directory for
   failed uploads. It exists only in the client's view, never on the server.
