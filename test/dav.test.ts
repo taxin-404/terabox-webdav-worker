@@ -250,6 +250,60 @@ describe('path segment decoding (RFC 3986, not form encoding)', () => {
 	});
 });
 
+describe('metadata cache (read-path filemetas collapse)', () => {
+	it('serves repeat GETs with a single filemetas round-trip', async () => {
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.filemetasCalls).toBe(1);
+		expect((await request('/a.txt')).status).toBe(200);
+		expect(tb.filemetasCalls).toBe(1);
+	});
+
+	it('shares the fill with stat (PROPFIND Depth 0) — no new upstream call', async () => {
+		const first = await request('/a.txt', { method: 'PROPFIND', headers: { Depth: '0' } });
+		expect(first.status).toBe(207);
+		const after = tb.filemetasCalls;
+		const second = await request('/a.txt', { method: 'PROPFIND', headers: { Depth: '0' } });
+		expect(second.status).toBe(207);
+		expect(tb.filemetasCalls).toBe(after);
+	});
+
+	it('never caches negative lookups', async () => {
+		expect((await request('/missing.txt')).status).toBe(404);
+		const after = tb.filemetasCalls;
+		expect((await request('/missing.txt')).status).toBe(404);
+		expect(tb.filemetasCalls).toBe(after + 1);
+	});
+
+	it('invalidates on PUT so the next GET re-fetches and serves new bytes', async () => {
+		await request('/a.txt');
+		const put = await request('/a.txt', { method: 'PUT', body: 'updated body' });
+		expect(put.status).toBe(204);
+		const before = tb.filemetasCalls;
+		const res = await request('/a.txt');
+		expect(await res.text()).toBe('updated body');
+		expect(tb.filemetasCalls).toBe(before + 1);
+	});
+
+	it('MOVE drops both names: destination visible, source gone', async () => {
+		await request('/a.txt');
+		const mv = await request('/a.txt', {
+			method: 'MOVE',
+			headers: { Destination: ORIGIN + '/moved.txt' },
+		});
+		expect(mv.status).toBe(201);
+		expect((await request('/moved.txt')).status).toBe(200);
+		expect((await request('/a.txt')).status).toBe(404);
+	});
+
+	it('resetDavVolatileState clears the cache (test isolation)', async () => {
+		await request('/a.txt');
+		expect(tb.filemetasCalls).toBe(1);
+		resetDavVolatileState();
+		await request('/a.txt');
+		expect(tb.filemetasCalls).toBe(2);
+	});
+});
+
 describe('PUT and MKCOL parents', () => {
 	it('PUT to a new file returns 201', async () => {
 		const res = await request('/put-new.txt', {

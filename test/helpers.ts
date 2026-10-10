@@ -46,6 +46,8 @@ export interface MockNode {
 export class MockTerabox {
 	nodes = new Map<string, MockNode>();
 	private uploads = new Map<string, Map<number, Uint8Array>>();
+	/** filemetas round-trips served — lets tests assert cache behaviour. */
+	filemetasCalls = 0;
 
 	/** Test knobs: force an endpoint to fail with this errno (0 = healthy). */
 	membershipErrno = 0;
@@ -243,6 +245,7 @@ export class MockTerabox {
 				return json({ errno: 0, list: this.children(dir).sort((a, b) => (a.name < b.name ? -1 : 1)).map((n) => this.wire(n)) });
 			}
 			if (pathname === '/api/filemetas') {
+				this.filemetasCalls++;
 				const target = JSON.parse(url.searchParams.get('target') || '[]') as string[];
 				const dlink = url.searchParams.get('dlink') === '1';
 				const info = target.map((p) => {

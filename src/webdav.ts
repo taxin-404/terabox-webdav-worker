@@ -9,7 +9,7 @@ import {
 import {
   collectTokens,
   createDavStore,
-  resetDavVolatileState,
+  resetDavVolatileState as resetDavStoreState,
   type DavStore,
   type LockRecord,
   type PathState,
@@ -18,7 +18,11 @@ import {
 } from './davstate';
 import type { Dentry, TeraboxItem } from './types';
 
-export { resetDavVolatileState };
+/** Clears every advisory layer the HTTP surface keeps in this isolate. */
+export function resetDavVolatileState(): void {
+  resetDavStoreState();
+  metaCache.clear();
+}
 export type { LockRecord };
 
 export const DAV_NS = 'DAV:';
@@ -199,9 +203,40 @@ export interface DavResource {
   contentType: string;
 }
 
+/**
+ * Read-side item metadata cache — the Google Drive worker keeps metadata in
+ * `config.cache` for five minutes for the same reason: a filemetas round-trip
+ * is a paced upstream hop (~0.7 s) and WebDAV clients pay it constantly
+ * (davfs issues a Depth:0 PROPFIND per attribute lookup and one GET per range
+ * chunk — at 64 KiB chunks mount reads crawled at ~24 KB/s). Entries are
+ * always filled with the dlink flavour so statResource and handleGet share one
+ * fill. 60 s bounds staleness of size/etag after an *external* change; writes
+ * through this worker invalidate immediately (exact path, subtree, parent).
+ * Negative lookups are never cached — a created file must appear at once.
+ */
+const META_TTL_MS = 60_000;
+const metaCache = new Map<string, { item: TeraboxItem; expires: number }>();
+
+async function itemInfoCached(client: TeraboxClient, absPath: string): Promise<TeraboxItem> {
+  const hit = metaCache.get(absPath);
+  if (hit && hit.expires > Date.now()) return hit.item;
+  const item = await client.itemInfo(absPath, true);
+  metaCache.set(absPath, { item, expires: Date.now() + META_TTL_MS });
+  return item;
+}
+
+/** Drop a mutated path, everything beneath it, and the parent's own entry. */
+function invalidateMeta(absPath: string): void {
+  metaCache.delete(absPath);
+  const prefix = absPath.endsWith('/') ? absPath : absPath + '/';
+  for (const key of [...metaCache.keys()]) if (key.startsWith(prefix)) metaCache.delete(key);
+  const slash = absPath.lastIndexOf('/');
+  metaCache.delete(slash <= 0 ? '/' : absPath.slice(0, slash));
+}
+
 async function statResource(client: TeraboxClient, absPath: string): Promise<Dentry | null> {
   try {
-    const item = await client.itemInfo(absPath, false);
+    const item = await itemInfoCached(client, absPath);
     return await itemToDentry(item);
   } catch (error) {
     if (errIsNum(error, -9)) return null;
@@ -691,13 +726,14 @@ async function handleMkcol(
     if (errIsNum(error, -8)) return errorResponse('Method Not Allowed', 405);
     throw error;
   }
+  invalidateMeta(absPath);
   return new Response(null, { status: 201 });
 }
 
 async function handleGet(request: Request, client: TeraboxClient, absPath: string, isHead: boolean): Promise<Response> {
   let item;
   try {
-    item = await client.itemInfo(absPath, true);
+    item = await itemInfoCached(client, absPath);
   } catch (error) {
     if (errIsNum(error, -9)) return errorResponse('Not Found', 404);
     throw error;
@@ -883,6 +919,7 @@ async function handlePut(
     throw error;
   }
 
+  invalidateMeta(absPath);
   return new Response(null, { status: existed ? 204 : 201 });
 }
 
@@ -900,6 +937,7 @@ async function handleDelete(
   if (pre) return pre;
   await client.fileOperation('delete', [{ path: absPath }]);
   await store.relocate([{ src: absPath, mode: 'forget', recursive: resource.isDir }]);
+  invalidateMeta(absPath);
   return new Response(null, { status: 204 });
 }
 
@@ -974,6 +1012,7 @@ async function handleMoveCopy(
     // node is recoverable from the recycle bin, never destroyed.
     await client.fileOperation('delete', [{ path: destPath }]);
     await store.relocate([{ src: destPath, mode: 'forget', recursive: destResource.isDir }]);
+    invalidateMeta(destPath);
   }
 
   const recursive = srcResource.isDir;
@@ -983,6 +1022,7 @@ async function handleMoveCopy(
     // never its members (litmus copy_shallow).
     await client.mkdir(destPath);
     await store.relocate([{ src: srcPath, dest: destPath, mode: 'copy', recursive: false }]);
+    invalidateMeta(destPath);
     return new Response(null, { status: destResource && overwrite ? 204 : 201 });
   }
 
@@ -1006,6 +1046,8 @@ async function handleMoveCopy(
     },
   ]);
 
+  invalidateMeta(srcPath);
+  invalidateMeta(destPath);
   return new Response(null, { status: destResource && overwrite ? 204 : 201 });
 }
 
