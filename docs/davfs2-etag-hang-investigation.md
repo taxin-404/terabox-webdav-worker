@@ -89,7 +89,8 @@ this bug.
 
 ## Environment
 
-- Worker: `https://terabox.taxin-404.workers.dev/` (Basic `REDACTED:REDACTED`),
+- Worker: `https://terabox.taxin-404.workers.dev/` (Basic auth —
+  credentials **not stored in this repo**; pass via `WEBDAV_USER`/`WEBDAV_PASS`),
   deployed from this repo's `main` (auto-deploy on push; run the gates below
   before every push).
 - Mount: `/mnt/webdav1`, fstab entry
@@ -272,7 +273,7 @@ The mount re-open check is still the right way to verify the *config* fix.
    upstream fetch:
 
    ```
-   while :; do curl -s -u REDACTED:REDACTED -D - -o /dev/null --max-time 12 \
+   while :; do curl -s -u "$WEBDAV_USER:$WEBDAV_PASS" -D - -o /dev/null --max-time 12 \
      'https://terabox.taxin-404.workers.dev/dav/John%20Wick%20(2014)%20720p%20BluRay%20x264%20ESub%20%5BDual%20Audio%5D%5BHindi%205.1+English%205.1%5D%20-mkvC.mkv' \
      2>/dev/null | grep -iE '^(HTTP|content-range|etag)' | tr -d '\r'; sleep 65; done
    ```
@@ -363,7 +364,8 @@ was not what looped here). Worth shipping as defence-in-depth and correctness:
   TLS request-record sizes (`write(4, …) = N`) to infer whether conditional
   headers were present without decrypting.
 - Direct TeraBox API for cross-checks: `GET /api/list?dir=%2Fomacom&…` with
-  the cookie from `~/secrets.md` (lowercase `ndus=…` line) and a Firefox UA.
+  the session cookie (local, never committed; lowercase `ndus=…` line) and a
+  Firefox UA.
   `/api/filemetas` needs the worker's minted jsToken (errno 2 without it) —
   probe metadata through the worker instead.
 

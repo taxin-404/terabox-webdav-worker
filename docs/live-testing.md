@@ -152,7 +152,7 @@ precreate (`errno 0`) → superfile2 chunk (`{"md5":"ebf5..."}`) → create
 
 Also confirmed live:
 - the old www/`ndus`-only session is fully gated now (`400141` even on GET)
-- `check/login` on `dm` = `errno 0` (`uk REDACTED`); on `www` = `-6`
+- `check/login` on `dm` = `errno 0` (valid `uk`); on `www` = `-6`
 - filemetas needs `target` (paths), not `fs_ids`; dlink host = `dm-d.terabox.com`
   → 302 to `kul-ddata.terabox.com` (region=kul)
 - download speed from the user's PC: ~29 KB/s direct vs 2.5 Mbps via JP VPN
@@ -323,9 +323,10 @@ clients are never harmed by the hopping: an empty store *allows* writes
 
 ### Verification tooling
 
-- litmus built from source: `TESTS="basic copymove props locks http"
-  /tmp/opencode/litmus/install/bin/litmus -k -n
-  https://terabox.taxin-404.workers.dev/litmus/ REDACTED REDACTED`
+- litmus built from source (credentials via env, never committed):
+  `TESTS="basic copymove props locks http"
+  WEBDAV_USER=… WEBDAV_PASS=…; /tmp/opencode/litmus/install/bin/litmus -k -n
+  https://terabox.taxin-404.workers.dev/litmus/ "$WEBDAV_USER" "$WEBDAV_PASS"`
 - probe habit: to check which build is live, PUT to a path whose parent does
   **not** exist — `409` = new build, `201`/`204` = old build still serving.
 
