@@ -330,6 +330,27 @@ clients are never harmed by the hopping: an empty store *allows* writes
 - probe habit: to check which build is live, PUT to a path whose parent does
   **not** exist — `409` = new build, `201`/`204` = old build still serving.
 
+### rclone end-to-end (v1.75.2, live)
+
+Real-client proof on top of litmus (`vendor = other`, RFC-strict flow):
+
+| step | result |
+|---|---|
+| `mkdir` tree, `copy` (2 parallel transfers, 1.3 MiB total) | ✓ |
+| `ls` | 4 objects, correct sizes |
+| `check --download` | **0 differences, 4/4 files md5-matched** |
+| no-op `sync` | 0 differences |
+| append + `sync` + `check --download` | 4/4 matched again |
+| `moveto` (WebDAV MOVE) | ✓ |
+| `size`, `delete` | ✓, empty after |
+
+### Cleanup
+
+Live test directories purged through the worker after the campaign:
+`/litmus/` (litmus base), `/conf-test/`, leftover probe dirs from earlier
+batteries (`/probe/`, `/livetestlive/`, `/livetest3/`) and the empty
+`/rclone-test/`. Account root holds only real user data again.
+
 ## Repo map (context for AI sessions)
 
 - `taxin-404/terabox-webdav-worker` — this project (TypeScript Worker)
