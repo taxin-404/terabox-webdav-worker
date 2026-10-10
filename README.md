@@ -27,30 +27,38 @@ cookie.
 
 ## Setup
 
-Create the Worker with these secrets/vars:
+Everything is configured in **your** dashboard — the repo carries no
+per-instance values. Only genuine credentials are Secrets; everything else
+is an ordinary (optional) Variable:
 
-| Key | Example | Notes |
-| --- | --- | --- |
-| `USERS` | `alice:s3cret,bob:hunter2` | comma/newline separated `user:pass` pairs |
-| `COOKIE` | `ndus=...; stoken=...; lang=en` | **full** Terabox cookie string from your browser (all cookies — `stoken` matters for uploads) |
-| `TERABOX_DOMAIN` | `https://dm.terabox.com` | optional mirror host (default `www.terabox.com`) — **regional deployments matter**: the upload clusters come from this origin's locateupload |
-| `JSTOKEN` | `a1b2c3...` | optional pre-minted token: `window.jsToken` in the terabox.com console (same as Alist/CLI); skips automatic minting |
-| `MIN_GAP_MS` | `400` | optional rate pacing between Terabox calls (default `400`; bclone parity) |
-| `PATH` | `/dav/` | optional base path the WebDAV is served under (gdrive parity): requests outside it 404, the bare base 301s to `/dav/`, hrefs include it |
-| `ROOT_ID` | `/backup` | optional Terabox folder mounted as the WebDAV root (gdrive parity; Terabox keys folders by path): clients see only that subtree |
+| Key | Type | Example | Notes |
+| --- | --- | --- | --- |
+| `USERS` | **Secret** | `alice:s3cret,bob:hunter2` | comma/newline separated `user:pass` pairs |
+| `COOKIE` | **Secret** | `ndus=...; stoken=...; lang=en` | **full** Terabox cookie string from your browser (all cookies — `stoken` matters for uploads) |
+| `JSTOKEN` | **Secret**, optional | `a1b2c3...` | pre-minted `window.jsToken` from the terabox.com console (same as Alist/CLI); skips automatic minting |
+| `TERABOX_DOMAIN` | Variable, optional | `https://dm.terabox.com` | origin mirror (default `https://www.terabox.com`). **Regional accounts must set their own** — the wrong origin rejects the cookie with `errno -6`; upload clusters come from this origin's locateupload |
+| `MIN_GAP_MS` | Variable, optional | `400` | pacing between Terabox calls (default `400`; bclone parity) |
+| `PATH` | Variable, optional | `/dav/` | base path the WebDAV is served under (gdrive parity): requests outside it 404, the bare base 301s to `/dav/`, hrefs include it |
+| `ROOT_ID` | Variable, optional | `/backup` | Terabox folder mounted as the WebDAV root (gdrive parity; Terabox keys folders by path): clients see only that subtree |
+| `LOG_PREFIX` | Variable, optional | `[prod]` | tag prepended to worker logs |
 
-`PATH`/`ROOT_ID` are **per-instance**: set them in your own dashboard
-(Workers → your Worker → Settings → Variables). They are deliberately not
-committed to `wrangler.toml` — each deployment of this repo carries its own
-values — and `keep_vars = true` guarantees every deploy preserves them.
+All Variables are user-made per instance (Workers → Settings → Variables
+and Secrets) and deliberately not committed to `wrangler.toml` — each
+deployment of this repo carries its own values, preserved across deploys by
+`keep_vars = true`. Nothing beyond `USERS`/`COOKIE`/`JSTOKEN` needs to be a
+secret: a mirror host or a base path is ordinary configuration.
+
+**No manual Durable Object setup**: the `DavState` class (lock +
+dead-prop state) is declared in `wrangler.toml` `[exports]` and provisioned
+automatically on the first deploy.
 
 ```sh
 wrangler secret put USERS
 wrangler secret put COOKIE
+# optional:
+wrangler secret put JSTOKEN
 npx wrangler deploy
 ```
-
-Prefer secrets over vars: `COOKIE` and `JSTOKEN` are genuine credentials.
 
 Rate limiting: every outbound Terabox call (API, token mint, download stream)
 is spaced by `MIN_GAP_MS`, retries honour `Retry-After` (capped at 5 s), and
@@ -72,13 +80,15 @@ The Worker auto-deploys from Git: the dashboard's Git integration watches
    npm ci --legacy-peer-deps
    ```
 6. In the created Worker → **Settings → Variables and Secrets**, add the
-   secrets (`USERS`, `COOKIE`, optionally `JSTOKEN`) and any per-instance
-   vars (`PATH`, `ROOT_ID`, `LOG_PREFIX`). Shared defaults (`TERABOX_DOMAIN`,
-   `MIN_GAP_MS`) ship in `wrangler.toml` `[vars]`; dashboard-only vars are
-   preserved on deploy via `keep_vars = true`.
+   three Secrets (`USERS`, `COOKIE`, optionally `JSTOKEN`) and any optional
+   Variables you want (`TERABOX_DOMAIN`, `MIN_GAP_MS`, `PATH`, `ROOT_ID`,
+   `LOG_PREFIX`). All env values are per-instance and user-made — none ship
+   in `wrangler.toml` — and dashboard-only vars survive deploys via
+   `keep_vars = true`.
    Dashboard deploys do not read `.dev.vars` or `wrangler secret put`.
 
-Every `git push origin main` triggers a deploy.
+Every `git push origin main` triggers a deploy; the first deploy also
+provisions the `DavState` Durable Object class automatically.
 
 ## rclone usage
 

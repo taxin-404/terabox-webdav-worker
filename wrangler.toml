@@ -4,23 +4,32 @@ compatibility_date = "2024-12-01"
 workers_dev = true
 preview_urls = true
 
-# Preserve dashboard-only plain-text vars across every deploy. Per-instance
-# config (PATH, ROOT_ID, LOG_PREFIX — each deployer's own values) lives in
-# THEIR dashboard, never in this shared file, and must not be wiped when a
-# push re-deploys. Secrets are never deleted by deploys either way.
+# Preserve dashboard-only plain-text vars across every deploy: ALL runtime
+# config is per-instance and user-made in each deployer's dashboard, never
+# in this shared file, so a push must not wipe it. Secrets are never
+# deleted by deploys either way.
 keep_vars = true
 
 [observability]
 enabled = true
 
-# Shared non-sensitive defaults live HERE, so every deployment re-applies
-# them. Per-instance vars stay in each deployer's dashboard (preserved via
-# `keep_vars = true` above). CREDENTIALS (USERS/COOKIE/JSTOKEN) must be set
-# as *Secrets* in the dashboard only: this repo is public, never put them
-# here as plain text.
-[vars]
-TERABOX_DOMAIN = "https://dm.terabox.com"
-MIN_GAP_MS = "400"
+# NO [vars] in this file — every environment value is user-made in the
+# deployer's dashboard (preserved by `keep_vars = true` above):
+#
+#   Secrets   (genuine credentials — dashboard type "Secret", never plain):
+#             USERS, COOKIE, JSTOKEN
+#
+#   Variables (plain, all optional — code defaults apply when unset):
+#             TERABOX_DOMAIN  origin mirror; default https://www.terabox.com
+#                             — REGIONAL accounts must set their own (this
+#                             account: https://dm.terabox.com), otherwise
+#                             the cookie is rejected (errno -6)
+#             MIN_GAP_MS      pacing between Terabox calls (default 400)
+#             PATH            base path the WebDAV lives under (e.g. /dav/)
+#             ROOT_ID         Terabox folder mounted as the WebDAV root
+#             LOG_PREFIX      optional log tag
+#
+# This repo is public: never commit credentials or instance config here.
 
 # Advisory WebDAV state (locks + dead props) for the WHOLE account lives in
 # one Durable Object: every isolate talks to the same serialized instance,
