@@ -1,5 +1,6 @@
 import { SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { resetDavVolatileState } from '../src/webdav';
 import { AUTH, MockTerabox, ORIGIN, UPLOAD_BASE, installMock } from './helpers';
 
 let tb: MockTerabox;
@@ -20,6 +21,9 @@ const request = (path: string, init: RequestInit = {}): Promise<Response> =>
 	});
 
 beforeEach(() => {
+	// Advisory lock/dead-prop state lives per isolate: clear it so cases
+	// never leak locks or properties into each other.
+	resetDavVolatileState();
 	tb = new MockTerabox();
 	seed(tb);
 	installMock(tb);
@@ -477,7 +481,8 @@ describe('RFC 4918 conformance', () => {
 		const body = await res.text();
 		expect(body).toContain('<D:displayname>a.txt</D:displayname>');
 		expect(body).toContain('HTTP/1.1 404 Not Found');
-		expect(body).toContain('<D:getcontentlanguage/>');
+		// 404 propstats echo the client's element, made self-contained.
+		expect(body).toContain('<D:getcontentlanguage xmlns:D="DAV:"/>');
 		expect(body).toContain('<X:custom xmlns:X="urn:x-example"/>');
 		// Not requested → not in any 200 propstat.
 		expect(body).not.toContain('<D:getcontentlength>');
@@ -527,12 +532,32 @@ describe('RFC 4918 conformance', () => {
 		expect(body).toContain('opaquelocktoken:');
 		expect(body).toContain('<D:timeout>Second-3600</D:timeout>');
 		expect(body).toContain('<D:owner><D:href>tester</D:href></D:owner>');
-		expect(res.headers.get('Lock-Token')).toContain('opaquelocktoken:');
+		const token = res.headers.get('Lock-Token')!;
+		expect(token).toContain('opaquelocktoken:');
 
 		const unlock = await request('/a.txt', {
 			method: 'UNLOCK',
-			headers: { 'Lock-Token': '<opaquelocktoken:whatever>' },
+			headers: { 'Lock-Token': token },
 		});
+		expect(unlock.status).toBe(204);
+	});
+
+	it('UNLOCK with a mismatched token is 409', async () => {
+		const res = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		const token = res.headers.get('Lock-Token')!;
+		const bogus = await request('/a.txt', {
+			method: 'UNLOCK',
+			headers: { 'Lock-Token': '<opaquelocktoken:00000000-0000-0000-0000-000000000000:123>' },
+		});
+		expect(bogus.status).toBe(409);
+		const missingHeader = await request('/a.txt', { method: 'UNLOCK' });
+		expect(missingHeader.status).toBe(400);
+		// The real token still works after the failed attempts.
+		const unlock = await request('/a.txt', { method: 'UNLOCK', headers: { 'Lock-Token': token } });
 		expect(unlock.status).toBe(204);
 	});
 
@@ -630,5 +655,454 @@ describe('overwrite semantics (server never replaces in place)', () => {
 		expect(tb.find('/target-dir/old.txt')).toBeUndefined();
 		expect(tb.find('/target-dir/b & c.txt')).toBeDefined();
 		expect(tb.find('/docs')).toBeUndefined();
+	});
+});
+
+describe('XML request validation', () => {
+	it('PROPFIND with non-well-formed XML is 400, not a silent allprop', async () => {
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: '<foo>',
+		});
+		expect(res.status).toBe(400);
+	});
+
+	it('PROPFIND with an empty namespace binding is 400', async () => {
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body:
+				'<D:propfind xmlns:D="DAV:"><D:prop><bar:foo xmlns:bar=""/></D:prop></D:propfind>',
+		});
+		expect(res.status).toBe(400);
+	});
+
+	it('PROPFIND with an undeclared prefix is 400', async () => {
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: '<E:propfind xmlns:D="DAV:"><D:prop><D:displayname/></D:prop></E:propfind>',
+		});
+		expect(res.status).toBe(400);
+	});
+
+	it('PROPFIND with mismatched close tags is 400', async () => {
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: '<D:propfind xmlns:D="DAV:"><D:prop><D:displayname></D:prop></D:propfind>',
+		});
+		expect(res.status).toBe(400);
+	});
+
+	it('PROPPATCH with non-well-formed XML is 400', async () => {
+		const res = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: '<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>',
+		});
+		expect(res.status).toBe(400);
+	});
+});
+
+describe('parent collections (RFC 4918 creation rules)', () => {
+	it('MKCOL with a missing parent is 409', async () => {
+		const res = await request('/missing-parent/child', { method: 'MKCOL' });
+		expect(res.status).toBe(409);
+		expect(tb.find('/missing-parent')).toBeUndefined();
+	});
+
+	it('MKCOL under a file parent is 409', async () => {
+		const res = await request('/a.txt/child', { method: 'MKCOL' });
+		expect(res.status).toBe(409);
+	});
+
+	it('COPY into a missing collection is 409', async () => {
+		const res = await request('/a.txt', {
+			method: 'COPY',
+			headers: { Destination: ORIGIN + '/nonesuch/file.txt' },
+		});
+		expect(res.status).toBe(409);
+		expect(tb.find('/a.txt')).toBeDefined();
+		expect(tb.find('/nonesuch')).toBeUndefined();
+	});
+
+	it('MOVE into a missing collection is 409', async () => {
+		const res = await request('/a.txt', {
+			method: 'MOVE',
+			headers: { Destination: ORIGIN + '/nonesuch/file.txt' },
+		});
+		expect(res.status).toBe(409);
+		expect(tb.find('/a.txt')).toBeDefined();
+	});
+
+	it('accepts an absolute-path Destination (no scheme/host)', async () => {
+		const res = await request('/a.txt', {
+			method: 'COPY',
+			headers: { Destination: '/abs-dest.txt' },
+		});
+		expect(res.status).toBe(201);
+		expect(tb.find('/abs-dest.txt')).toBeDefined();
+		expect(tb.find('/a.txt')).toBeDefined();
+	});
+});
+
+describe('COPY Depth: 0', () => {
+	it('copies only the collection itself, never its members', async () => {
+		await request('/shallow-src', { method: 'MKCOL' });
+		await request('/shallow-src/foo.txt', { method: 'PUT', body: 'foo' });
+		const res = await request('/shallow-src', {
+			method: 'COPY',
+			headers: { Destination: ORIGIN + '/shallow-dest', Depth: '0' },
+		});
+		expect(res.status).toBe(201);
+		expect(tb.find('/shallow-dest')?.isdir).toBe(1);
+		expect(tb.find('/shallow-dest/foo.txt')).toBeUndefined();
+		expect(tb.find('/shallow-src/foo.txt')).toBeDefined();
+	});
+
+	it('full-depth COPY still brings the members along', async () => {
+		await request('/deep-src', { method: 'MKCOL' });
+		await request('/deep-src/foo.txt', { method: 'PUT', body: 'foo' });
+		const res = await request('/deep-src', {
+			method: 'COPY',
+			headers: { Destination: ORIGIN + '/deep-dest' },
+		});
+		expect(res.status).toBe(201);
+		expect(tb.find('/deep-dest/foo.txt')).toBeDefined();
+	});
+});
+
+describe('dead properties', () => {
+	const PROPSET = (inner: string) =>
+		`<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>${inner}</D:prop></D:set></D:propertyupdate>`;
+	const PROPGET = (inner: string) =>
+		`<D:propfind xmlns:D="DAV:"><D:prop>${inner}</D:prop></D:propfind>`;
+
+	it('stores a set property and serves it from PROPFIND', async () => {
+		const set = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: PROPSET('<X:tag xmlns:X="urn:x-example">v1</X:tag>'),
+		});
+		expect(set.status).toBe(207);
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: PROPGET('<X:tag xmlns:X="urn:x-example"/>'),
+		});
+		const body = await res.text();
+		expect(body).toContain('<D:status>HTTP/1.1 200 OK</D:status>');
+		expect(body).toContain('>v1<');
+	});
+
+	it('distinguishes namespaces for the same local name', async () => {
+		await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: PROPSET('<X:s xmlns:X="urn:one">1</X:s><Y:s xmlns:Y="urn:two">2</Y:s>'),
+		});
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: PROPGET('<X:s xmlns:X="urn:one"/><Y:s xmlns:Y="urn:two"/><Z:s xmlns:Z="urn:three"/>'),
+		});
+		const body = await res.text();
+		expect(body).toContain('>1<');
+		expect(body).toContain('>2<');
+		// The unknown namespace falls into the 404 propstat.
+		expect(body).toContain('<Z:s xmlns:Z="urn:three"/>');
+	});
+
+	it('a removed property answers 404 again', async () => {
+		await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: PROPSET('<X:tag xmlns:X="urn:x-example">v1</X:tag>'),
+		});
+		const remove = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body:
+				'<D:propertyupdate xmlns:D="DAV:"><D:remove><D:prop>' +
+				'<X:tag xmlns:X="urn:x-example"/></D:prop></D:remove></D:propertyupdate>',
+		});
+		expect(remove.status).toBe(207);
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: PROPGET('<X:tag xmlns:X="urn:x-example"/>'),
+		});
+		expect(await res.text()).toContain('HTTP/1.1 404 Not Found');
+	});
+
+	it('refuses to patch DAV live props (403 propstat)', async () => {
+		const res = await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: PROPSET('<D:displayname xmlns:D="DAV:">nope</D:displayname>'),
+		});
+		expect(res.status).toBe(207);
+		const body = await res.text();
+		expect(body).toContain('HTTP/1.1 403 Forbidden');
+		// The live value is unchanged.
+		const propfind = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: PROPGET('<D:displayname xmlns:D="DAV:"/>'),
+		});
+		expect(await propfind.text()).toContain('<D:displayname>a.txt</D:displayname>');
+	});
+
+	it('migrates dead properties with the resource on MOVE', async () => {
+		await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: PROPSET('<X:tag xmlns:X="urn:x-example">keep</X:tag>'),
+		});
+		const move = await request('/a.txt', {
+			method: 'MOVE',
+			headers: { Destination: ORIGIN + '/prop-moved.txt' },
+		});
+		expect(move.status).toBe(201);
+		const res = await request('/prop-moved.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: PROPGET('<X:tag xmlns:X="urn:x-example"/>'),
+		});
+		expect(await res.text()).toContain('>keep<');
+	});
+
+	it('copies dead properties on COPY', async () => {
+		await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: PROPSET('<X:tag xmlns:X="urn:x-example">duplicated</X:tag>'),
+		});
+		const copy = await request('/a.txt', {
+			method: 'COPY',
+			headers: { Destination: ORIGIN + '/prop-copy.txt' },
+		});
+		expect(copy.status).toBe(201);
+		const res = await request('/prop-copy.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: PROPGET('<X:tag xmlns:X="urn:x-example"/>'),
+		});
+		expect(await res.text()).toContain('>duplicated<');
+	});
+
+	it('clears dead properties on DELETE (no stale values on reuse)', async () => {
+		await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: PROPSET('<X:tag xmlns:X="urn:x-example">gone</X:tag>'),
+		});
+		expect((await request('/a.txt', { method: 'DELETE' })).status).toBe(204);
+		await request('/a.txt', { method: 'PUT', body: 'recreated' });
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: PROPGET('<X:tag xmlns:X="urn:x-example"/>'),
+		});
+		expect(await res.text()).toContain('HTTP/1.1 404 Not Found');
+	});
+
+	it('includes dead properties in allprop and propname', async () => {
+		await request('/a.txt', {
+			method: 'PROPPATCH',
+			headers: { 'Content-Type': 'application/xml' },
+			body: PROPSET('<X:tag xmlns:X="urn:x-example">listed</X:tag>'),
+		});
+		const all = await request('/a.txt', { method: 'PROPFIND', headers: { Depth: '0' } });
+		expect(await all.text()).toContain('>listed<');
+		const names = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0' },
+			body: '<D:propfind xmlns:D="DAV:"><D:propname/></D:propfind>',
+		});
+		expect(await names.text()).toContain('<X:tag xmlns:X="urn:x-example"/>');
+	});
+});
+
+describe('lock enforcement', () => {
+	const LOCK_BODY =
+		'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+		'<D:locktype><D:write/></D:locktype><D:owner><D:href>tester</D:href></D:owner></D:lockinfo>';
+	const SHARED_BODY = LOCK_BODY.replace('<D:exclusive/>', '<D:shared/>');
+
+	const lock = async (path: string, body: string = LOCK_BODY): Promise<string> => {
+		const res = await request(path, {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body,
+		});
+		expect(res.status).toBe(200);
+		return res.headers.get('Lock-Token')!;
+	};
+
+	it('rejects every un-tokened write with 423', async () => {
+		const token = await lock('/a.txt');
+		for (const [method, init] of [
+			['PUT', { body: 'nope' }],
+			['DELETE', {}],
+			['PROPPATCH', { headers: { 'Content-Type': 'application/xml' }, body: '<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><X:a xmlns:X="urn:x">1</X:a></D:prop></D:set></D:propertyupdate>' }],
+			['MOVE', { headers: { Destination: ORIGIN + '/elsewhere.txt' } }],
+		] as const) {
+			const res = await request('/a.txt', { method, ...init });
+			expect(res.status, `${method} on a locked resource`).toBe(423);
+		}
+		// COPY *onto* the locked resource is refused as well.
+		const copy = await request('/dest.txt', {
+			method: 'COPY',
+			headers: { Destination: ORIGIN + '/a.txt' },
+		});
+		expect(copy.status).toBe(423);
+		// And nothing was modified.
+		expect(new TextDecoder().decode(tb.find('/a.txt')!.content)).toBe('the quick brown fox\n');
+		expect(tb.find('/elsewhere.txt')).toBeUndefined();
+		// The owner can still write, presenting the token via If.
+		const owned = await request('/a.txt', {
+			method: 'PUT',
+			headers: { If: `(${token})` },
+			body: 'owner wrote this',
+		});
+		expect(owned.status).toBe(204);
+	});
+
+	it('copying a locked resource without its token succeeds and carries no lock', async () => {
+		await lock('/a.txt');
+		const copy = await request('/a.txt', {
+			method: 'COPY',
+			headers: { Destination: ORIGIN + '/lock-copy.txt' },
+		});
+		expect(copy.status).toBe(201);
+		const discover = await request('/lock-copy.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: '<D:propfind xmlns:D="DAV:"><D:prop><D:lockdiscovery/></D:prop></D:propfind>',
+		});
+		expect(await discover.text()).toContain('<D:lockdiscovery/>');
+	});
+
+	it('LOCK on an already-locked resource is 423', async () => {
+		await lock('/a.txt');
+		const again = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(again.status).toBe(423);
+	});
+
+	it('lockdiscovery reports the active lock with token and owner', async () => {
+		const token = await lock('/a.txt');
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: '<D:propfind xmlns:D="DAV:"><D:prop><D:lockdiscovery/></D:prop></D:propfind>',
+		});
+		const body = await res.text();
+		expect(body).toContain('<D:activelock>');
+		expect(body).toContain('<D:owner><D:href>tester</D:href></D:owner>');
+		// Tokens are URI-safe (uuid + expiry); the href carries no brackets.
+		expect(body).toContain(token.slice(1, -1));
+	});
+
+	it('a second shared lock stacks and each token unlocks its own', async () => {
+		const first = await lock('/a.txt', SHARED_BODY);
+		const second = await lock('/a.txt', SHARED_BODY);
+		expect(second).not.toBe(first);
+		// A shared lock still blocks non-owners.
+		const del = await request('/a.txt', { method: 'DELETE' });
+		expect(del.status).toBe(423);
+		expect((await request('/a.txt', { method: 'UNLOCK', headers: { 'Lock-Token': first } })).status).toBe(204);
+		// Still locked by the second token.
+		expect((await request('/a.txt', { method: 'DELETE' })).status).toBe(423);
+		expect((await request('/a.txt', { method: 'UNLOCK', headers: { 'Lock-Token': second } })).status).toBe(204);
+		expect((await request('/a.txt', { method: 'DELETE' })).status).toBe(204);
+	});
+
+	it('an exclusive lock does not stack on a shared lock', async () => {
+		await lock('/a.txt', SHARED_BODY);
+		const exclusive = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(exclusive.status).toBe(423);
+	});
+
+	it('If-evaluation: bogus token 412 unlocked / 423 locked, corrupt token 423', async () => {
+		// Unlocked resource: <DAV:no-lock> identifies no lock → 412.
+		const unlocked = await request('/a.txt', {
+			method: 'PUT',
+			headers: { If: '(<DAV:no-lock>)' },
+			body: 'x',
+		});
+		expect(unlocked.status).toBe(412);
+		const token = await lock('/a.txt');
+		// Locked resource with a wrong token: 423.
+		const locked = await request('/a.txt', {
+			method: 'PUT',
+			headers: { If: '(<DAV:no-lock>)' },
+			body: 'x',
+		});
+		expect(locked.status).toBe(423);
+		const inner = token.slice(1, -1);
+		const corrupt = await request('/a.txt', {
+			method: 'PUT',
+			headers: { If: `(<${inner}x>)` },
+			body: 'x',
+		});
+		expect(corrupt.status).toBe(423);
+		// A valid token passes.
+		const valid = await request('/a.txt', { method: 'PUT', headers: { If: `(${token})` }, body: 'y' });
+		expect(valid.status).toBe(204);
+	});
+
+	it('If-evaluation: a stale etag fails with 412 even for the lock owner', async () => {
+		const token = await lock('/a.txt');
+		const res = await request('/a.txt', {
+			method: 'PUT',
+			headers: { If: `(${token} ["stale-etag"])` },
+			body: 'x',
+		});
+		expect(res.status).toBe(412);
+	});
+
+	it('honours a still-valid self-issued token after advisory state is lost', async () => {
+		// Simulates isolate rotation: the record is gone, but the token the
+		// client holds embeds its expiry and must keep working.
+		const token = await lock('/a.txt');
+		resetDavVolatileState();
+		const res = await request('/a.txt', {
+			method: 'PUT',
+			headers: { If: `(${token})` },
+			body: 'still writable',
+		});
+		expect(res.status).toBe(204);
+		// Without the token, the fresh (empty) store no longer blocks either.
+		expect((await request('/a.txt', { method: 'DELETE' })).status).toBe(204);
+	});
+
+	it('an Infinity lock on a collection guards its descendants', async () => {
+		await request('/lockcoll', { method: 'MKCOL' });
+		const token = await lock('/lockcoll');
+		await request('/lockcoll/file.txt', { method: 'PUT', headers: { If: `(${token})` }, body: 'in' });
+		// Un-tokened writes to a child are refused.
+		expect((await request('/lockcoll/file.txt', { method: 'PUT', body: 'no' })).status).toBe(423);
+		expect((await request('/lockcoll/child', { method: 'MKCOL' })).status).toBe(423);
+		// Refresh through the child (token targets the collection).
+		const refresh = await request('/lockcoll/file.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml', If: `(${token})` },
+			body: LOCK_BODY,
+		});
+		expect(refresh.status).toBe(200);
+		// Unlock the collection; the child is free again.
+		expect((await request('/lockcoll', { method: 'UNLOCK', headers: { 'Lock-Token': token } })).status).toBe(204);
+		expect((await request('/lockcoll/file.txt', { method: 'PUT', body: 'free' })).status).toBe(204);
 	});
 });
