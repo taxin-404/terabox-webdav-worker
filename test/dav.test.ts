@@ -209,6 +209,86 @@ describe('GET / HEAD', () => {
 	});
 });
 
+describe('GET status normalization (RFC 7233 §4.1 — davfs2 etag poison)', () => {
+	it('re-states an unrequested upstream 206 as 200 with no Content-Range', async () => {
+		// The live PCS flap: the upstream answers 206 to a plain GET. davfs2
+		// captures an etag only from an exactly-200 response, so surfacing the
+		// 206 would null its stored validator and force a full re-download on
+		// every later open — the open()-hang of the investigation doc.
+		tb.unrequestedFull206 = true;
+		const node = tb.find('/a.txt')!;
+		const res = await request('/a.txt');
+		expect(res.status).toBe(200);
+		expect(res.headers.get('Content-Range')).toBeNull();
+		expect(res.headers.get('Content-Length')).toBe(String(node.size));
+		expect(res.headers.get('ETag')).toBe(`"${node.md5}"`);
+		expect(await res.text()).toBe('the quick brown fox\n');
+		// HEAD takes the same path and must not surface 206 either.
+		const head = await request('/a.txt', { method: 'HEAD' });
+		expect(head.status).toBe(200);
+		expect(head.headers.get('Content-Range')).toBeNull();
+	});
+
+	it('still 304s a revalidation while the upstream flap is active', async () => {
+		tb.unrequestedFull206 = true;
+		const md5 = tb.find('/a.txt')!.md5;
+		const res = await request('/a.txt', { headers: { 'If-None-Match': `"${md5}"` } });
+		expect(res.status).toBe(304);
+		expect(res.headers.get('ETag')).toBe(`"${md5}"`);
+		expect((await new Response(res.body).arrayBuffer()).byteLength).toBe(0);
+	});
+
+	it('rejects a truncated 206 and falls through the ladder to a full body', async () => {
+		// Only the pcs flavour answers a genuine partial: the worker must not
+		// stream it as a complete file, and must keep walking the ladder.
+		tb.unrequestedPartial206 = ['pcs'];
+		const res = await request('/a.txt');
+		expect(res.status).toBe(200);
+		expect(res.headers.get('Content-Range')).toBeNull();
+		expect(await res.text()).toBe('the quick brown fox\n');
+	});
+
+	it('never streams a partial body: all candidates truncated → 502', async () => {
+		tb.unrequestedPartial206 = ['pcs', 'official', 'plain'];
+		const res = await request('/a.txt');
+		expect(res.status).toBe(502);
+		const body = await res.text();
+		// Not a 200 pretending to be whole; not the truncated half either.
+		expect(body).not.toBe('the quic');
+		expect(body).not.toBe('the quick brown fox\n');
+	});
+
+	it('keeps a ranged request a 206 (the flap knob only fires without Range)', async () => {
+		tb.unrequestedFull206 = true;
+		const res = await request('/a.txt', { headers: { Range: 'bytes=0-2' } });
+		expect(res.status).toBe(206);
+		expect(await res.text()).toBe('the');
+		expect(res.headers.get('Content-Range')).toBe(`bytes 0-2/${tb.find('/a.txt')!.size}`);
+	});
+});
+
+describe('GET validators for md5-less items', () => {
+	it('answers the PROPFIND fallback etag on GET/HEAD and honours it with 304', async () => {
+		tb.seed('/nomd5.bin', { content: '0123456789', md5: '' });
+		const node = tb.find('/nomd5.bin')!;
+		const fallback = `"${node.server_mtime}-${node.size}-0"`;
+		// PROPFIND and GET must serve the *same* validator: a GET without an
+		// ETag header nulls davfs2's stored one and poisons every later open.
+		const propfind = await request('/nomd5.bin', { method: 'PROPFIND', headers: { Depth: '0' } });
+		expect(await propfind.text()).toContain(
+			`<D:getetag>${fallback.replace(/"/g, '&quot;')}</D:getetag>`,
+		);
+		const res = await request('/nomd5.bin');
+		expect(res.status).toBe(200);
+		expect(res.headers.get('ETag')).toBe(fallback);
+		const head = await request('/nomd5.bin', { method: 'HEAD' });
+		expect(head.headers.get('ETag')).toBe(fallback);
+		const revalidated = await request('/nomd5.bin', { headers: { 'If-None-Match': fallback } });
+		expect(revalidated.status).toBe(304);
+		expect(revalidated.headers.get('ETag')).toBe(fallback);
+	});
+});
+
 describe('path segment decoding (RFC 3986, not form encoding)', () => {
 	it('treats a raw "+" in the request path as a literal plus', async () => {
 		tb.seed('/5.1+English.txt', { content: 'dual audio bytes' });

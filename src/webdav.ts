@@ -180,6 +180,20 @@ export function makeMount(opts?: { basePath?: string; rootId?: string }): Mount 
   };
 }
 
+/**
+ * Stable validator for a resource: the md5 when the backend provides one,
+ * otherwise the same `"mtime-size-isdir"` fallback PROPFIND serves. GET/HEAD
+ * and PROPFIND must always agree, and a GET that answers *without* an ETag
+ * strips the validator a client stored earlier — davfs2 captures an etag only
+ * from an exactly-200 response, overwrites its stored one with NULL when the
+ * header is missing, and then re-downloads the whole file on every open.
+ */
+export function etagFor(item: TeraboxItem): string {
+  return item.md5
+    ? `"${item.md5}"`
+    : `"${item.server_mtime || 0}-${item.size || 0}-${item.isdir || 0}"`;
+}
+
 async function itemToDentry(item: TeraboxItem): Promise<Dentry> {
   return {
     name: item.server_filename || '',
@@ -187,7 +201,7 @@ async function itemToDentry(item: TeraboxItem): Promise<Dentry> {
     isDir: (item.isdir || 0) > 0,
     size: item.size || 0,
     mtimeMs: (item.server_mtime || 0) * 1000,
-    etag: item.md5 ? `"${item.md5}"` : `"${item.server_mtime}-${item.size}-${item.isdir}"`,
+    etag: etagFor(item),
     contentType: (item.isdir || 0) > 0 ? 'httpd/unix-directory' : contentTypeFor(item.server_filename || ''),
   };
 }
@@ -730,6 +744,31 @@ async function handleMkcol(
   return new Response(null, { status: 201 });
 }
 
+/**
+ * Verdict for an upstream 206 that arrived although the client asked for the
+ * whole entity: the total length when the body is provably complete (safe to
+ * re-state as 200), or null when it is a genuine partial (it must never be
+ * streamed as a complete file — the caller rejects the candidate instead).
+ */
+function unrequestedPartialIsFull(upstream: Response, size: number): number | null {
+  const contentRange = upstream.headers.get('Content-Range');
+  const declared = upstream.headers.get('Content-Length');
+  const length = declared === null ? Number.NaN : Number(declared);
+  if (contentRange) {
+    const m = /^bytes\s+(\d+)-(\d+)\/(\d+)$/.exec(contentRange.trim());
+    if (!m) return null;
+    const start = Number(m[1]);
+    const end = Number(m[2]);
+    const total = Number(m[3]);
+    // Self-consistent full extent, and a Content-Length that agrees with it.
+    if (start !== 0 || total === 0 || end !== total - 1) return null;
+    if (declared !== null && length !== total) return null;
+    return total;
+  }
+  // No extent given: only a body whose length matches the known size is safe.
+  return Number.isFinite(length) && length > 0 && length === size ? length : null;
+}
+
 async function handleGet(request: Request, client: TeraboxClient, absPath: string, isHead: boolean): Promise<Response> {
   let item;
   try {
@@ -747,12 +786,12 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'no-store',
   });
-  const etag = item.md5 ? `"${item.md5}"` : null;
-  if (etag) headers.set('ETag', etag);
+  const etag = etagFor(item);
+  headers.set('ETag', etag);
 
   // Conditional GET: validators answer before a download link is minted.
   const inm = request.headers.get('If-None-Match');
-  if (inm && etag) {
+  if (inm) {
     const tags = inm.split(',').map((tag) => tag.trim());
     if (inm.trim() === '*' || tags.includes(etag) || tags.includes(`W/${etag}`)) {
       return new Response(null, {
@@ -769,7 +808,7 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
         status: 304,
         headers: {
           'Last-Modified': rfc1123(lastModifiedMs),
-          ...(etag ? { ETag: etag } : {}),
+          ETag: etag,
           'Cache-Control': 'no-store',
         },
       });
@@ -823,11 +862,17 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
       if (upstream.status === 416) {
         // Range not satisfiable: pass the CDN's verdict through instead of
         // burning the remaining ladder phases on ranges it will also refuse.
-        const contentRange = upstream.headers.get('Content-Range');
-        if (contentRange) headers.set('Content-Range', contentRange);
-        const contentLength = upstream.headers.get('Content-Length');
-        if (contentLength) headers.set('Content-Length', contentLength);
-        return new Response(upstream.body, { status: 416, headers });
+        // Only when a range was actually asked for — a 416 answer to a full
+        // GET is an upstream fault, and the ladder should keep trying.
+        if (range) {
+          const contentRange = upstream.headers.get('Content-Range');
+          if (contentRange) headers.set('Content-Range', contentRange);
+          const contentLength = upstream.headers.get('Content-Length');
+          if (contentLength) headers.set('Content-Length', contentLength);
+          return new Response(upstream.body, { status: 416, headers });
+        }
+        lastError = new TeraboxError(-5, 'Terabox answered 416 to a full GET');
+        return undefined;
       }
       if (!upstream.ok && upstream.status !== 206) {
         lastError = new TeraboxError(-5, `Terabox download http error ${upstream.status}`);
@@ -840,8 +885,35 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
         const contentRange = upstream.headers.get('Content-Range');
         if (contentRange) headers.set('Content-Range', contentRange);
       }
-      if (isHead) return new Response(null, { status: upstream.status, headers });
-      return new Response(upstream.body, { status: upstream.status, headers });
+      // RFC 7233 §4.1: a server must not answer 206 to a request that did not
+      // ask for a range. The PCS route flaps into exactly that, and davfs2
+      // captures an etag only from an exactly-200 GET — one unrequested 206
+      // nulls the client's stored validator and every later open re-downloads
+      // the whole file (docs/davfs2-etag-hang-investigation.md). Normalize:
+      // an unrequested 206 whose body is provably the whole entity is
+      // re-stated as 200; a genuinely partial body is rejected outright —
+      // never streamed as a complete file — so the ladder moves to the next
+      // candidate. A 206 that *was* asked for passes through verbatim.
+      let status = upstream.status;
+      if (status === 206 && !range) {
+        const fullLength = unrequestedPartialIsFull(upstream, item.size || 0);
+        if (fullLength === null) {
+          headers.delete('Content-Length');
+          headers.delete('Content-Range');
+          void upstream.body?.cancel().catch(() => undefined);
+          lastError = new TeraboxError(-5, 'Terabox served a partial body for a full GET');
+          return undefined;
+        }
+        status = 200;
+        headers.set('Content-Length', String(fullLength));
+        headers.delete('Content-Range');
+      } else if (status === 200) {
+        // A full entity may satisfy a ranged request (RFC 7233 §3.1) but must
+        // not carry a Content-Range that describes only part of it.
+        headers.delete('Content-Range');
+      }
+      if (isHead) return new Response(null, { status, headers });
+      return new Response(upstream.body, { status, headers });
     } catch (error) {
       lastError = error;
       return undefined;

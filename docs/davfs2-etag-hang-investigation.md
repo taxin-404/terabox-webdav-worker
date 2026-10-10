@@ -1,9 +1,11 @@
 # davfs2 large-file re-download investigation (open() "hangs forever")
 
-Status: **root cause narrowed to a single unobserved link; fix designed, not yet
-implemented.** Written2026-10-10 as a handoff for an independent diagnosis pass.
-Everything below was established from the davfs2 source (Debian sid tree) plus a
-live `strace -f` of the real daemon against the production worker.
+Status: **root cause identified; fix implemented on `fix/davfs2-etag-hang`
+(pending review — not yet on `main`/production).** Originally written
+2026-10-10 as a handoff for an independent diagnosis pass; the "Proposed fix"
+section below is now the implemented change. Everything was established from
+the davfs2 source (Debian sid tree) plus a live `strace -f` of the real daemon
+against the production worker.
 
 ## TL;DR
 
@@ -194,23 +196,32 @@ observed — the status was TLS-encrypted and `wrangler tail` was down.
    instantly. If it does, the loop is confirmed as "one bad status poisons the
    client forever" and the fix below is exactly right.
 
-## Proposed fix (designed, not yet implemented)
+## Proposed fix (implemented on `fix/davfs2-etag-hang`)
 
 1. **Never surface a `206` to a client that did not ask for a range** (and
    never surface a bare `200` body as if it satisfied a range): in
-   `handleGet`'s `tryUrl`, normalize — client sent no `Range` → force status
-   200 and drop any upstream `Content-Range`; client sent a `Range` and
-   upstream answered `200` with the full entity → keep `200` (RFC 7233 allows
-   it) but drop `Content-Range`. This removes the only mechanism that can
-   destroy a davfs2 client's etag, and is a correctness fix in its own right
-   (RFC 7233 §4.1: a server must not send `206` unless the request had a range).
-2. **Stable etag for GET/HEAD** via a shared `etagFor(item)` helper (md5 →
-   `"<server_mtime>-<size>-<isdir>"` fallback, exactly like `statResource`), so
-   a fill without md5 can never strip the validator either.
+   `handleGet`'s `tryUrl`, normalize — client sent no `Range` and the upstream
+   `206` is verifiably the whole entity (`Content-Range` spans `0-(total-1)`
+   with a matching `Content-Length`, or the length equals the known size) →
+   force status 200 and drop `Content-Range`; a genuinely partial body is
+   **rejected** (ladder moves to the next candidate, never streamed as a
+   complete file); client sent a `Range` and upstream answered `200` with the
+   full entity → keep `200` (RFC 7233 allows it) but drop `Content-Range`.
+   A `416` to a request that carried no `Range` is likewise treated as an
+   upstream fault instead of being passed through. This removes the only
+   mechanism that can destroy a davfs2 client's etag, and is a correctness
+   fix in its own right (RFC 7233 §4.1: a server must not send `206` unless
+   the request had a range).
+2. **Stable etag for GET/HEAD** via the shared `etagFor(item)` helper (md5 →
+   `"<server_mtime>-<size>-<isdir>"` fallback, exactly like `statResource`),
+   so a fill without md5 can never strip the validator either — GET and
+   PROPFIND now serve the identical value by construction.
 3. Tests: unit tests with a mocked upstream answering `206` to a no-Range GET
    (client must see `200`, no `Content-Range`, `ETag` present, body intact);
-   INM + upstream-`206` must still yield `304`; the etag fallback case for a
-   md5-less item.
+   a truncated `206` must fall through the ladder, and all-truncated must
+   answer 502 rather than a partial body; INM + upstream-`206` must still
+   yield `304`; the etag fallback case for a md5-less item. All six fail
+   against the pre-fix code (verified by stashing the source change).
 4. Gates before push (they auto-deploy `main`):
 
    ```
@@ -218,6 +229,10 @@ observed — the status was TLS-encrypted and `wrangler tail` was down.
    npm run typecheck && npm test -- --run && npx wrangler deploy --dry-run
    ```
 
+   Result on the branch: typecheck clean, 142/142 tests, dry-run bundles.
+   (A 10-sample live flap hunt on 2026-10-10 answered `200` every time — the
+   upstream flap is intermittent, so production verification still needs the
+   mount check below after merge.)
 5. Live verification through the mount: open the video once (one final full
    download), then re-open — expect instant open, zero `write(6,…)` cache
    writes in the strace, and a `304` visible as an empty-body dispatch.

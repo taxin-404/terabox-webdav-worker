@@ -69,6 +69,15 @@ export class MockTerabox {
 	 *  (app-route shape, pre-redirect) — proves error_code JSON is raised as
 	 *  an error instead of streamed as file content. */
 	gatePcs = false;
+	/** Answer a *no-Range* /dl/ GET with 206 anyway — the live PCS flap that
+	 *  poisons a davfs2 client's stored etag (it captures an etag only from an
+	 *  exactly-200). 'full' sends the whole entity under a full-extent
+	 *  Content-Range: the worker must re-state it as 200. */
+	unrequestedFull206 = false;
+	/** Flavours whose no-Range /dl/ GET answers a genuinely truncated 206 —
+	 *  the worker must reject it and fall through the download ladder instead
+	 *  of streaming a partial body as a complete file. */
+	unrequestedPartial206: Array<'plain' | 'official' | 'pcs'> = [];
 
 	constructor() {
 		this.nodes.set('/', { path: '/', name: '', isdir: 1, size: 0, server_mtime: 1704067200, md5: '' });
@@ -187,6 +196,30 @@ export class MockTerabox {
 			if (!node || node.isdir) return new Response('not found', { status: 404 });
 			const bytes = node.content ?? new Uint8Array(0);
 			const range = req.headers.get('Range');
+			if (!range && bytes.byteLength > 0) {
+				// Unrequested-206 emulation (the live PCS flap under test).
+				if (this.unrequestedFull206) {
+					return new Response(bytes, {
+						status: 206,
+						headers: {
+							'Content-Length': String(bytes.byteLength),
+							'Content-Range': `bytes 0-${bytes.byteLength - 1}/${bytes.byteLength}`,
+							'Accept-Ranges': 'bytes',
+						},
+					});
+				}
+				if (this.unrequestedPartial206.includes(flavour)) {
+					const half = bytes.slice(0, Math.max(1, bytes.byteLength >> 1));
+					return new Response(half, {
+						status: 206,
+						headers: {
+							'Content-Length': String(half.byteLength),
+							'Content-Range': `bytes 0-${half.byteLength - 1}/${bytes.byteLength}`,
+							'Accept-Ranges': 'bytes',
+						},
+					});
+				}
+			}
 			if (range) {
 				const m = /^bytes=(\d*)-(\d*)$/.exec(range);
 				if (m && (m[1] !== '' || m[2] !== '')) {
