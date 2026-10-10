@@ -209,6 +209,47 @@ describe('GET / HEAD', () => {
 	});
 });
 
+describe('path segment decoding (RFC 3986, not form encoding)', () => {
+	it('treats a raw "+" in the request path as a literal plus', async () => {
+		tb.seed('/5.1+English.txt', { content: 'dual audio bytes' });
+		const res = await request('/5.1+English.txt');
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('dual audio bytes');
+	});
+
+	it('decodes %2B to the same literal plus', async () => {
+		tb.seed('/5.1+English.txt', { content: 'dual audio bytes' });
+		const res = await request('/5.1%2BEnglish.txt');
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('dual audio bytes');
+	});
+
+	it('still decodes %20 to a space', async () => {
+		tb.seed('/two words.txt', { content: 'spaced content' });
+		const res = await request('/two%20words.txt');
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('spaced content');
+	});
+
+	it('encodes "+" as %2B in PROPFIND hrefs so clients can re-request it', async () => {
+		tb.seed('/5.1+English.mkv', { content: 'x' });
+		const res = await request('/', { method: 'PROPFIND', headers: { Depth: '1' } });
+		expect(res.status).toBe(207);
+		expect(await res.text()).toContain('5.1%2BEnglish.mkv');
+	});
+
+	it('MOVE resolves a raw "+" in both source path and Destination', async () => {
+		tb.seed('/old+name.txt', { content: 'move me' });
+		const res = await request('/old+name.txt', {
+			method: 'MOVE',
+			headers: { Destination: ORIGIN + '/new+name.txt' },
+		});
+		expect(res.status).toBe(201);
+		expect(tb.find('/old+name.txt')).toBeUndefined();
+		expect(tb.find('/new+name.txt')).toBeDefined();
+	});
+});
+
 describe('PUT and MKCOL parents', () => {
 	it('PUT to a new file returns 201', async () => {
 		const res = await request('/put-new.txt', {

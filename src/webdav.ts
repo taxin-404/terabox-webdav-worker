@@ -99,7 +99,12 @@ export function decodePathname(pathname: string): string {
     }
     let name = segment;
     try {
-      name = decodeURIComponent(segment.replace(/\+/g, '%20'));
+      // RFC 3986: in a *path*, `+` is a literal plus — only query strings
+      // form-decode it to a space. Form semantics here silently renamed every
+      // `+` file (media names like "5.1+English.mkv") to a nonexistent
+      // space-name and 404'd davfs/rclone lookups. Same rule as the Google
+      // Drive worker: plain decodeURIComponent, nothing else.
+      name = decodeURIComponent(segment);
     } catch {
       throw new TeraboxError(-9, 'Invalid path encoding');
     }
@@ -318,7 +323,11 @@ async function enforceWrite(
 }
 
 function activelockXml(rec: LockRecord): string {
-  const seconds = Math.max(0, Math.floor((rec.expiresAt - Date.now()) / 1000));
+  // Ceil, not floor: the record was created milliseconds ago with
+  // expiresAt = now + 3600s, so the remaining value is 3599.99x — flooring
+  // intermittently rendered Second-3599 on the very response that granted a
+  // Second-3600 lock (a real sub-second flake, caught by the suite).
+  const seconds = Math.max(0, Math.ceil((rec.expiresAt - Date.now()) / 1000));
   return (
     `<D:activelock>` +
     `<D:locktype><D:write/></D:locktype>` +
