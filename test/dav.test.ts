@@ -709,7 +709,10 @@ describe('RFC 4918 conformance', () => {
 		expect(body).toContain('<D:activelock>');
 		expect(body).toContain('opaquelocktoken:');
 		expect(body).toContain('<D:timeout>Second-3600</D:timeout>');
-		expect(body).toContain('<D:owner><D:href>tester</D:href></D:owner>');
+		// Owner markup is stored self-contained (prefixes hoisted from the
+		// request body), so re-emission in lockdiscovery can never go
+		// namespace-dead when the client declared D: on the lock root only.
+		expect(body).toContain('<D:owner xmlns:D="DAV:"><D:href xmlns:D="DAV:">tester</D:href></D:owner>');
 		const token = res.headers.get('Lock-Token')!;
 		expect(token).toContain('opaquelocktoken:');
 
@@ -1183,7 +1186,7 @@ describe('lock enforcement', () => {
 		});
 		const body = await res.text();
 		expect(body).toContain('<D:activelock>');
-		expect(body).toContain('<D:owner><D:href>tester</D:href></D:owner>');
+		expect(body).toContain('<D:owner xmlns:D="DAV:"><D:href xmlns:D="DAV:">tester</D:href></D:owner>');
 		// Tokens are URI-safe (uuid + expiry); the href carries no brackets.
 		expect(body).toContain(token.slice(1, -1));
 	});

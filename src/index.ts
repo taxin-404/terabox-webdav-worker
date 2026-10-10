@@ -65,6 +65,16 @@ function statusFor(error: unknown): number {
   if (errIsNum(error, 4000023)) return 401;
   if (errIsNum(error, 400141)) return 401;
   if (errIsNum(error, 450016)) return 401;
+  // -10 / -32: "Your space is insufficient"; 58: "File is too large for
+  // your plan" — every storage-capacity refusal is 507 per RFC 4918
+  // §9.3.1/§9.7.1, so davfs/rclone can distinguish "disk full" from a
+  // server fault (docs/terabox-limits.md promised this mapping).
+  if (errIsNum(error, -10) || errIsNum(error, -32) || errIsNum(error, 58)) return 507;
+  // -7: Terabox rejects the file name — a client error, not a server fault.
+  if (errIsNum(error, -7)) return 403;
+  // 31045 "user not exists": the request reached a wrong-region upload
+  // cluster — an upstream routing problem, not ours.
+  if (errIsNum(error, 31045)) return 502;
   // -5: an upstream HTTP hop failed — that's a gateway problem, not ours.
   if (errIsNum(error, -5)) return 502;
   return 500;

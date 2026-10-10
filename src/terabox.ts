@@ -317,6 +317,9 @@ export class TeraboxClient {
     }
 
     if (RETRY_STATUS.has(response.status) && attempt < 3) {
+      // Workers anti-pattern guard: an unread response body keeps the
+      // connection open — release it before sleeping/recursing.
+      void response.body?.cancel().catch(() => undefined);
       // bclone pacing: honour Retry-After when present, cap the sleep at 5 s.
       const retryAfter = Number(response.headers.get('Retry-After'));
       const delay =
@@ -471,6 +474,7 @@ export class TeraboxClient {
     const absDir = tbPath(dir);
     const items: TeraboxItem[] = [];
     const pageSize = 100;
+    const MAX_PAGES = 100;
     for (let page = 1; ; page++) {
       const { json } = await this.request<{ errno?: number; list?: TeraboxItem[] }>('/api/list', {
         query: { dir: absDir, page: String(page), num: String(pageSize) },
@@ -478,7 +482,15 @@ export class TeraboxClient {
       const batch = json.list || [];
       items.push(...batch);
       if (batch.length === 0 || batch.length < pageSize) break;
-      if (batch.length >= pageSize && page >= 100) break;
+      // The API caps a listing at 100 pages (10 000 entries). Stopping
+      // silently would make sync clients (rclone/davfs) treat the missing
+      // tail as deletions on the next sync — fail loudly instead.
+      if (page >= MAX_PAGES) {
+        throw new TeraboxError(
+          -5,
+          `Directory listing truncated: ${dir} exceeds ${MAX_PAGES * pageSize} entries`,
+        );
+      }
     }
     return items;
   }
@@ -993,18 +1005,24 @@ export class TeraboxClient {
     if (returnType === 2) throw es(-8);
 
     const chunkSize = getChunkSize(size, this.isPremium);
-    const chunks: Array<{ partSeq: number; md5: string; data: Uint8Array }> = [];
-
-    if (size === 0) {
-      chunks.push({ partSeq: 0, md5: await md5Hex(new Uint8Array(0)), data: new Uint8Array(0) });
-    } else {
-      for (let offset = 0, partSeq = 0; offset < bytes.byteLength; offset += chunkSize, partSeq += 1) {
-        const data = bytes.slice(offset, Math.min(offset + chunkSize, bytes.byteLength));
-        chunks.push({ partSeq, md5: await md5Hex(data), data });
-      }
+    // Views, not copies: the previous implementation pre-built a `chunks`
+    // array of `bytes.slice(...)` windows — a full second copy of the file
+    // held for the whole upload (peak ~3× body with the Blob copies), which
+    // OOMs the isolate near the Workers request-body ceiling. Subarray views
+    // share the single arrayBuffer; md5s are computed per window and only
+    // the digest strings are retained. (True streaming would additionally
+    // drop the 1× body itself, but forfeits the transparent host-failover
+    // replay below — the body is single-use once consumed.)
+    const chunkCount = size === 0 ? 1 : Math.ceil(bytes.byteLength / chunkSize);
+    const chunkMd5s: string[] = [];
+    const windowAt = (index: number): Uint8Array =>
+      size === 0
+        ? new Uint8Array(0)
+        : bytes.subarray(index * chunkSize, Math.min((index + 1) * chunkSize, bytes.byteLength));
+    for (let index = 0; index < chunkCount; index += 1) {
+      chunkMd5s.push(await md5Hex(windowAt(index)));
     }
 
-    const chunkMd5s = chunks.map((chunk) => chunk.md5);
     // The browser walks locateupload's candidate server list until one
     // accepts the upload (wrong-cluster hosts answer HTTP 403
     // error_code 31045 "user not exists"). Mirror that: retry the chunk
@@ -1014,12 +1032,12 @@ export class TeraboxClient {
     for (let hostIndex = 0; hostIndex < hosts.length; hostIndex += 1) {
       const host = hosts[hostIndex]!;
       try {
-        for (const chunk of chunks) {
-          const uploadedMd5 = await atStep(`chunk${chunk.partSeq}@${host}`, () =>
-            this.uploadChunk(host, absPath, uploadId, uploadSign, chunk.partSeq, chunk.data),
+        for (let index = 0; index < chunkCount; index += 1) {
+          const uploadedMd5 = await atStep(`chunk${index}@${host}`, () =>
+            this.uploadChunk(host, absPath, uploadId, uploadSign, index, windowAt(index)),
           );
-          if (uploadedMd5 !== chunk.md5) {
-            throw new TeraboxError(-5, `Uploaded chunk ${chunk.partSeq} md5 mismatch`);
+          if (uploadedMd5 !== chunkMd5s[index]) {
+            throw new TeraboxError(-5, `Uploaded chunk ${index} md5 mismatch`);
           }
         }
         this.uploadHost = host;

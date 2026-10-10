@@ -3,6 +3,7 @@ import { joinPath, splitPath } from './sign';
 import {
   collectXmlScope,
   parsePropElements,
+  selfContain,
   validateXml,
   type PropElement,
 } from './davxml';
@@ -112,6 +113,18 @@ export function decodePathname(pathname: string): string {
     } catch {
       throw new TeraboxError(-9, 'Invalid path encoding');
     }
+    // Percent-encoded dot-segments decode to the same literals and must get
+    // the identical cleanup: a raw `%2e%2e` used to survive as a literal
+    // ".." component into the upstream path, where Terabox-side
+    // normalization could walk above a ROOT_ID mount (DELETE/MOVE outside
+    // the bound). A decoded "/" would fabricate path structure the client
+    // never had a separator for — reject rather than guess.
+    if (name === '' || name === '.') continue;
+    if (name === '..') {
+      parts.pop();
+      continue;
+    }
+    if (name.includes('/')) throw new TeraboxError(-9, 'Invalid path encoding');
     parts.push(name);
   }
   return '/' + parts.join('/');
@@ -188,10 +201,19 @@ export function makeMount(opts?: { basePath?: string; rootId?: string }): Mount 
  * from an exactly-200 response, overwrites its stored one with NULL when the
  * header is missing, and then re-downloads the whole file on every open.
  */
+/**
+ * Best-effort modification time in seconds: `server_mtime` when the API
+ * provides it, then the client-visible `ctime`/`mtime` fields some list
+ * entries carry instead — never epoch 0 when any timestamp exists.
+ */
+export function mtimeSecondsOf(item: TeraboxItem): number {
+  return item.server_mtime || item.mtime || item.ctime || 0;
+}
+
 export function etagFor(item: TeraboxItem): string {
   return item.md5
     ? `"${item.md5}"`
-    : `"${item.server_mtime || 0}-${item.size || 0}-${item.isdir || 0}"`;
+    : `"${mtimeSecondsOf(item)}-${item.size || 0}-${item.isdir || 0}"`;
 }
 
 async function itemToDentry(item: TeraboxItem): Promise<Dentry> {
@@ -200,7 +222,7 @@ async function itemToDentry(item: TeraboxItem): Promise<Dentry> {
     path: item.path || '',
     isDir: (item.isdir || 0) > 0,
     size: item.size || 0,
-    mtimeMs: (item.server_mtime || 0) * 1000,
+    mtimeMs: mtimeSecondsOf(item) * 1000,
     etag: etagFor(item),
     contentType: (item.isdir || 0) > 0 ? 'httpd/unix-directory' : contentTypeFor(item.server_filename || ''),
   };
@@ -229,13 +251,27 @@ export interface DavResource {
  * Negative lookups are never cached — a created file must appear at once.
  */
 const META_TTL_MS = 60_000;
+/** Hard cap so a long-lived isolate touching many distinct paths cannot grow
+ *  the map without bound; oldest entries are evicted first (Map preserves
+ *  insertion order). 2000 × a few hundred bytes ≈ well under a megabyte. */
+const META_MAX_ENTRIES = 2000;
 const metaCache = new Map<string, { item: TeraboxItem; expires: number }>();
 
 async function itemInfoCached(client: TeraboxClient, absPath: string): Promise<TeraboxItem> {
   const hit = metaCache.get(absPath);
   if (hit && hit.expires > Date.now()) return hit.item;
   const item = await client.itemInfo(absPath, true);
-  metaCache.set(absPath, { item, expires: Date.now() + META_TTL_MS });
+  // Evict expired entries on write, then enforce the size cap FIFO.
+  const now = Date.now();
+  for (const [key, entry] of metaCache) {
+    if (entry.expires <= now) metaCache.delete(key);
+  }
+  while (metaCache.size >= META_MAX_ENTRIES) {
+    const oldest = metaCache.keys().next();
+    if (oldest.done) break;
+    metaCache.delete(oldest.value);
+  }
+  metaCache.set(absPath, { item, expires: now + META_TTL_MS });
   return item;
 }
 
@@ -288,7 +324,22 @@ function parseIfHeader(header: string): IfTerm[][] | null {
     }
     lists.push(terms);
   }
-  return lists.length > 0 ? lists : null;
+  if (lists.length > 0) return lists;
+  // RFC 4918 §10.2.1 also legalizes the paren-free forms: a bare
+  // `If: <opaquelocktoken:…>` (Tag-list) and `If: ["etag"]` (No-tag-list)
+  // are each a single one-term list. Rejecting them with 400 broke clients
+  // that send exactly those shapes.
+  const bareRe = /(Not\s+)?<([^>]*)>|\[([^\]]*)\]/g;
+  const terms: IfTerm[] = [];
+  let tm: RegExpExecArray | null;
+  while ((tm = bareRe.exec(header)) !== null) {
+    if (tm[2] !== undefined) {
+      terms.push({ negated: Boolean(tm[1]), kind: 'token', value: tm[2] });
+    } else {
+      terms.push({ negated: Boolean(tm[1]), kind: 'etag', value: tm[3] ?? '' });
+    }
+  }
+  return terms.length > 0 ? [terms] : null;
 }
 
 /**
@@ -382,11 +433,24 @@ function activelockXml(rec: LockRecord): string {
     `<D:locktype><D:write/></D:locktype>` +
     `<D:lockscope><D:${rec.scope}/></D:lockscope>` +
     `<D:depth>${xmlEscape(rec.depth)}</D:depth>` +
-    (rec.owner ? `<D:owner>${rec.owner}</D:owner>` : '') +
+    (rec.owner ? ownerElementXml(rec.owner) : '') +
     `<D:timeout>Second-${seconds}</D:timeout>` +
     `<D:locktoken><D:href>${xmlEscape(rec.token)}</D:href></D:locktoken>` +
     `</D:activelock>`
   );
+}
+
+/**
+ * Re-emit a stored lock owner without ever ill-forming the response. Lock
+ * owners arrive as client XML and are stored for the lock's lifetime; a
+ * record whose markup no longer parses (legacy records persisted before the
+ * LOCK-body validation existed, or an exotic prefix we could not
+ * self-contain) degrades to escaped text instead of breaking every PROPFIND
+ * 207 that carries this lockdiscovery.
+ */
+function ownerElementXml(owner: string): string {
+  const wrapped = `<D:owner xmlns:D="${DAV_NS}">${owner}</D:owner>`;
+  return validateXml(wrapped) === null ? wrapped : `<D:owner>${xmlEscape(owner)}</D:owner>`;
 }
 
 function lockdiscoveryMarkup(locks: LockRecord[]): string {
@@ -779,7 +843,7 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
   }
   if ((item.isdir || 0) > 0) return errorResponse('Method Not Allowed', 405);
 
-  const lastModifiedMs = (item.server_mtime || 0) * 1000;
+  const lastModifiedMs = mtimeSecondsOf(item) * 1000;
   const headers = new Headers({
     'Content-Type': contentTypeFor(item.server_filename || ''),
     'Last-Modified': rfc1123(lastModifiedMs),
@@ -872,10 +936,12 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
           return new Response(upstream.body, { status: 416, headers });
         }
         lastError = new TeraboxError(-5, 'Terabox answered 416 to a full GET');
+        void upstream.body?.cancel().catch(() => undefined);
         return undefined;
       }
       if (!upstream.ok && upstream.status !== 206) {
         lastError = new TeraboxError(-5, `Terabox download http error ${upstream.status}`);
+        void upstream.body?.cancel().catch(() => undefined);
         return undefined;
       }
 
@@ -912,7 +978,12 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
         // not carry a Content-Range that describes only part of it.
         headers.delete('Content-Range');
       }
-      if (isHead) return new Response(null, { status, headers });
+      // HEAD never hands the entity to the client — release the upstream
+      // stream instead of leaving it for the runtime to reap mid-flight.
+      if (isHead) {
+        void upstream.body?.cancel().catch(() => undefined);
+        return new Response(null, { status, headers });
+      }
       return new Response(upstream.body, { status, headers });
     } catch (error) {
       lastError = error;
@@ -971,7 +1042,11 @@ async function handlePut(
   let existing: { isDir: boolean } | null = null;
   try {
     existing = await statResource(client, absPath);
-  } catch {
+  } catch (error) {
+    // Only "doesn't exist" makes the target creatable; a network/gate
+    // failure (-5, -6, …) must propagate instead of being silently
+    // reinterpreted as an overwrite (which then misreports as 409).
+    if (!errIsNum(error, -9)) throw error;
     existing = null;
   }
   // PUT onto a collection is a method mismatch (RFC 7231 §6.5.5).
@@ -1058,6 +1133,15 @@ async function handleMoveCopy(
   const srcResource = await statResource(client, srcPath);
   if (!srcResource) return errorResponse('Not Found', 404);
 
+  // RFC 4918 §9.9.3/§9.9.4: a collection must not be copied or moved into
+  // its own descendant tree — Terabox would either duplicate the tree
+  // server-side or loop, so reject before touching the API.
+  if (srcResource.isDir) {
+    const srcNorm = joinPath(srcPath);
+    const destNorm = joinPath(destPath);
+    if (destNorm.startsWith(srcNorm + '/')) return errorResponse('Conflict', 409);
+  }
+
   // `If` conditions always target the request resource. A lock on the
   // source blocks MOVE but never COPY — copying a locked resource without
   // its token is fine (litmus locks/copy), overwriting a locked target is
@@ -1139,6 +1223,13 @@ async function handleLock(
 ): Promise<Response> {
   if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
   const body = await request.text();
+  // RFC 4918 §9.10: a LOCK body is XML; validate it exactly like PROPFIND /
+  // PROPPATCH. Without this a client could persist ill-formed markup as the
+  // lock owner and break every other client's lockdiscovery PROPFIND 207.
+  if (body.trim()) {
+    const xmlError = validateXml(body);
+    if (xmlError) return errorResponse(`Invalid XML: ${xmlError}`, 400);
+  }
   const resource = await statResource(client, absPath);
 
   const timeout = request.headers.get('Timeout') || '';
@@ -1154,7 +1245,11 @@ async function handleLock(
   const ownerBlock = body.match(
     /<(?:[A-Za-z0-9_]+:)?owner(?:\s[^>]*)?>([\s\S]*?)<\/(?:[A-Za-z0-9_]+:)?owner\s*>/,
   );
-  const owner = ownerBlock?.[1] ?? '';
+  let owner = ownerBlock?.[1] ?? '';
+  // Owner markup is re-emitted inside our own <D:owner> in every later
+  // lockdiscovery — hoist any prefix the client declared higher up in the
+  // request body into the fragment itself so it stays self-contained.
+  if (owner.includes('<')) owner = selfContain(owner, collectXmlScope(body));
   const depth = (request.headers.get('Depth') || '').toLowerCase() === '0' ? '0' : 'Infinity';
 
   const outcome = await store.lockAcquire(absPath, {
