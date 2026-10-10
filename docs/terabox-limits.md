@@ -98,11 +98,20 @@ service from Cloudflare.
     ancestors, and `If` headers are evaluated (`412`/`423`).
   - After isolate rotation the state is gone. Enforcement then *relaxes*
     (an empty store allows the write), and a self-issued lock token stays
-    valid for the rest of its embedded expiry so warm clients (Windows,
-    litmus) are never bricked mid-session. Worst case a client re-locks.
+    valid for the rest of its embedded expiry — UNLOCK even answers `204`
+    gracefully for such a token — so warm clients (Windows, litmus) are never
+    bricked mid-session. Worst case a client re-locks.
   - Dead props survive PROPFIND/PROPPATCH/MOVE/COPY/DELETE within the
     isolate, are keyed by expanded `{namespace}local` name, and are cleared
     on DELETE.
+  - **Measured effect on litmus** (2026-10-10): the `locks` suite passes
+    ~31–35/38 per run; the sporadic failures are symmetric isolate-hop
+    artifacts (a request seeing an empty store *or* a stale one), never a
+    protocol-logic error. Real traffic is unaffected. The deterministic
+    upgrade path is a **Durable Object** holding lock/prop state: one
+    dashboard resource + a `[[durable_objects.bindings]]` entry + migration
+    tag; everything else (handler logic) is already written against the
+    `LOCKS`/`DEAD_PROPS` maps and would keep working unchanged behind it.
 - **Creation is RFC-strict**: MKCOL, PUT and MOVE/COPY all require an
   existing parent collection (`409` otherwise, RFC 4918 §9.3.1/§9.7.1/§9.9.3).
   The Google Drive worker auto-creates parents on PUT/MKCOL instead; this

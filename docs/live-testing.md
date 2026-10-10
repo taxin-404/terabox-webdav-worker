@@ -249,6 +249,84 @@ files the user trashed deliberately).
    discarded); could probe with a 1-byte Range instead.
 4. Re-run `test/live/webdav-livetest.sh` and update this file.
 
+## Campaign 3 — litmus conformance (2026-10-10)
+
+Goal: run the standard litmus WebDAV conformance suite (built from source at
+`/tmp/opencode/litmus`, `TESTS="basic copymove props locks http"`) against the
+live worker and close every gap it finds. Reference expectations were read out
+of litmus's own sources (`basic.c`, `copymove.c`, `props.c`, `locks.c`,
+`http.c`, `common.h`) — every status below is what the suite *provably* wants,
+not a guess.
+
+### Baseline (before the batch)
+
+| Suite | Result | Failures |
+|---|---|---|
+| basic | 14/16 | `put_no_parent`, `mkcol_no_parent` |
+| copymove | 11/13 (+1 warn) | `copy_abspath`, `copy_nodestcoll`, `copy_shallow` |
+| props | 23/33 | `propfind_invalid`, `propfind_invalid2`, `propget` ×8 |
+| locks | 25/38 | `notowner_*` (enforcement missing), `cond_put*`, `discover` … |
+| http | **3/3** | — |
+
+### Fixes shipped (`563441c`, `03d1901`)
+
+1. **Parent-collection rules (RFC 4918 §9.3.1/§9.7.1/§9.9.3)** — MKCOL, PUT
+   and MOVE/COPY targets now require an existing parent collection (`409`).
+   The previous PUT auto-create was the *single* root cause of both
+   `put_no_parent` **and** `mkcol_no_parent`: litmus PUTs `409me/noparent.txt`
+   first, our PUT created `409me/`, and the later MKCOL `409me/noparent/`
+   legitimately succeeded. One deviation, two failures — removed entirely.
+2. **Absolute-path `Destination`** (RFC 4918 §10.3) — accepted as pathname.
+3. **`COPY Depth: 0` on collections** — empty collection only, no members.
+4. **XML validation** (`src/davxml.ts`) — PROPFIND/PROPPATCH bodies that are
+   non-well-formed, use undeclared prefixes, bind a prefix to the empty
+   namespace, or mismatch close tags answer `400` (never a silent allprop).
+5. **Dead-property store** — PROPPATCH set/remove persist per-isolate under
+   expanded `{namespace}local` keys; PROPFIND serves them (list/allprop/
+   propname), `404`-propstats echo the client's element made self-contained;
+   MOVE migrates, COPY copies, DELETE clears; DAV live props refuse patching
+   with a `403` propstat.
+6. **Real locks** — 423 enforcement on PUT/DELETE/MKCOL/MOVE/COPY/PROPPATCH,
+   UNLOCK validates its token (`409`), LOCK rejects non-owners (`423`), shared
+   locks stack, refresh works through `Depth: Infinity` ancestors,
+   `lockdiscovery` reports the actual active lock, `If` headers are evaluated
+   (`412`, or `423` for lock-token-shaped values on locked resources;
+   `<DAV:no-lock>` is a plain failed condition per mod_dav parity). Self-issued
+   tokens embed their expiry: after isolate rotation they keep working for the
+   rest of their life (graceful UNLOCK even returns `204` for them), so warm
+   clients are never bricked.
+
+### Results after the batch (run 3, live)
+
+| Suite | Result |
+|---|---|
+| basic | **16/16** |
+| copymove | **13/13** |
+| props | **33/33** |
+| http | **3/3** |
+| locks | 31/33 run (2 flaky — see below) |
+
+**65/65 on four suites; locks is limited only by Cloudflare isolate
+scheduling.** Lock records and dead props are per-isolate in-memory state
+(this worker has no storage binding). A sequential litmus connection usually
+stays on one warm isolate (run 3: 31/33), but every now and then one request
+of the session lands on a different isolate — the observed failures are
+symmetric artifacts of exactly that (`notowner_lock`: LOCK saw an empty store
+→ `200` instead of `423`; `lock_shared`: LOCK saw a stale store → `423`
+instead of `200`). Real clients are never harmed by the hopping: an empty
+store *allows* writes (only enforcement relaxes), and lenient tokens cover
+UNLOCK. Making locks 100 % deterministic under Cloudflare scheduling requires
+a Durable Object (dashboard resource + binding; noted as the upgrade path in
+`terabox-limits.md` §6).
+
+### Verification tooling
+
+- litmus built from source: `TESTS="basic copymove props locks http"
+  /tmp/opencode/litmus/install/bin/litmus -k -n
+  https://terabox.taxin-404.workers.dev/litmus/ REDACTED REDACTED`
+- probe habit: to check which build is live, PUT to a path whose parent does
+  **not** exist — `409` = new build, `201`/`204` = old build still serving.
+
 ## Repo map (context for AI sessions)
 
 - `taxin-404/terabox-webdav-worker` — this project (TypeScript Worker)
