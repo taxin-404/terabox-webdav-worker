@@ -329,7 +329,7 @@ async function checkMutationPreconditions(
     const lists = parseIfHeader(ifHeader);
     if (!lists) return errorResponse('Bad Request', 400);
     let anyTrue = false;
-    let invalidToken = false;
+    const invalidTokens = new Set<string>();
     let etag: string | null | undefined;
     for (const terms of lists) {
       let listTrue = terms.length > 0;
@@ -337,7 +337,7 @@ async function checkMutationPreconditions(
         let value: boolean;
         if (term.kind === 'token') {
           value = tokenApplies(term.value, path);
-          if (!term.negated && !value) invalidToken = true;
+          if (!term.negated && !value) invalidTokens.add(term.value);
         } else {
           if (etag === undefined) {
             const dentry = await statResource(client, path);
@@ -352,8 +352,15 @@ async function checkMutationPreconditions(
     }
     // A submitted lock token must identify a live lock even in a negated
     // position another list could satisfy — mod_dav rejects the request.
-    if (invalidToken) {
-      return applyingLocks(path).length > 0
+    // `<DAV:no-lock>` is the pseudo-token of the RFCs' own examples: it
+    // never identifies a lock, so it fails as a plain condition (412);
+    // a real lock-token-shaped value on a locked resource is a lock
+    // problem and answers 423.
+    if (invalidTokens.size > 0) {
+      const lockShaped = [...invalidTokens].some(
+        (t) => t.startsWith('opaquelocktoken:') || t.startsWith('urn:uuid:'),
+      );
+      return lockShaped && applyingLocks(path).length > 0
         ? errorResponse('Locked', 423)
         : errorResponse('Precondition Failed', 412);
     }
@@ -908,11 +915,12 @@ async function handlePut(request: Request, client: TeraboxClient, absPath: strin
   const pre = await checkMutationPreconditions(request, client, absPath);
   if (pre) return pre;
 
+  // RFC 4918 §9.7.1: creation needs existing intermediate collections (409).
+  const parentCheck = await requireParent(client, absPath);
+  if (parentCheck) return parentCheck;
+
   const bytes = new Uint8Array(await request.arrayBuffer());
   const size = bytes.byteLength;
-
-  // Create missing parents so clients that PUT without MKCOL work.
-  await ensureParent(client, absPath);
 
   let existing: { isDir: boolean } | null = null;
   try {
@@ -1147,6 +1155,10 @@ function handleUnlock(request: Request, absPath: string): Response {
   const records = purgeLocksAt(absPath);
   const index = records.findIndex((r) => r.token === token);
   if (index === -1) {
+    // A self-issued token whose record is gone (isolate rotation) means the
+    // lock has already lapsed: succeeding is the graceful answer. Anything
+    // else — a foreign or forged token — is a 409 per RFC 4918 §9.11.
+    if (isOurUnexpiredToken(token)) return new Response(null, { status: 204 });
     return errorResponse('Lock Token Does Not Match Any Lock on this Resource', 409);
   }
   records.splice(index, 1);
@@ -1239,9 +1251,8 @@ async function handleProppatch(
 }
 
 /**
- * RFC 4918 §9.3.1/§9.9.3: MKCOL and MOVE/COPY targets need an existing
- * parent collection (409). PUT deliberately keeps auto-creating parents
- * (Google Drive worker parity — see docs/terabox-limits.md).
+ * RFC 4918 §9.3.1/§9.7.1/§9.9.3: MKCOL, PUT and MOVE/COPY targets need an
+ * existing parent collection (409). Clients build the tree level by level.
  */
 async function requireParent(client: TeraboxClient, absPath: string): Promise<Response | null> {
   const { dir } = splitPath(absPath);
@@ -1249,32 +1260,6 @@ async function requireParent(client: TeraboxClient, absPath: string): Promise<Re
   const parent = await statResource(client, dir);
   if (!parent || !parent.isDir) return errorResponse('Conflict', 409);
   return null;
-}
-
-/** Recursively create missing parents for absPath (ignoring "already exists"). */
-async function ensureParent(client: TeraboxClient, absPath: string): Promise<void> {
-  const { dir } = splitPath(absPath);
-  if (!dir || dir === '/' || dir === '') return;
-
-  const segments = dir.split('/').filter(Boolean);
-  let cursor = '';
-  for (const segment of segments) {
-    cursor += '/' + segment;
-    try {
-      const existing = await statResource(client, cursor);
-      if (existing) {
-        if (!existing.isDir) throw new TeraboxError(-9, 'Parent is not a collection');
-        continue;
-      }
-    } catch (error) {
-      if (!errIsNum(error, -9)) throw error;
-    }
-    try {
-      await client.mkdir(cursor);
-    } catch (error) {
-      if (!errIsNum(error, -8)) throw error;
-    }
-  }
 }
 
 export function errorResponse(

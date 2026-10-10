@@ -238,11 +238,14 @@ describe('PUT and MKCOL parents', () => {
 		expect(tb.find('/empty.txt')?.size).toBe(0);
 	});
 
-	it('creates missing parents automatically', async () => {
+	it('PUT with a missing parent is 409 (RFC 4918 §9.7.1)', async () => {
 		const res = await request('/nested/deep/file.txt', { method: 'PUT', body: 'deep' });
-		expect(res.status).toBe(201);
-		expect(tb.find('/nested')?.isdir).toBe(1);
-		expect(tb.find('/nested/deep')?.isdir).toBe(1);
+		expect(res.status).toBe(409);
+		expect(tb.find('/nested')).toBeUndefined();
+		// The RFC flow works: create the tree, then PUT.
+		expect((await request('/nested', { method: 'MKCOL' })).status).toBe(201);
+		expect((await request('/nested/deep', { method: 'MKCOL' })).status).toBe(201);
+		expect((await request('/nested/deep/file.txt', { method: 'PUT', body: 'deep' })).status).toBe(201);
 		expect(tb.find('/nested/deep/file.txt')?.size).toBe(4);
 	});
 
@@ -1034,7 +1037,7 @@ describe('lock enforcement', () => {
 		expect(exclusive.status).toBe(423);
 	});
 
-	it('If-evaluation: bogus token 412 unlocked / 423 locked, corrupt token 423', async () => {
+	it('If-evaluation: DAV:no-lock is a failed condition (412), corrupt real token is 423', async () => {
 		// Unlocked resource: <DAV:no-lock> identifies no lock → 412.
 		const unlocked = await request('/a.txt', {
 			method: 'PUT',
@@ -1043,23 +1046,38 @@ describe('lock enforcement', () => {
 		});
 		expect(unlocked.status).toBe(412);
 		const token = await lock('/a.txt');
-		// Locked resource with a wrong token: 423.
+		// Locked resource, pseudo-token: still a plain failed condition → 412.
 		const locked = await request('/a.txt', {
 			method: 'PUT',
 			headers: { If: '(<DAV:no-lock>)' },
 			body: 'x',
 		});
-		expect(locked.status).toBe(423);
+		expect(locked.status).toBe(412);
 		const inner = token.slice(1, -1);
+		// A corrupt real-token-shaped value is a lock problem → 423.
 		const corrupt = await request('/a.txt', {
 			method: 'PUT',
 			headers: { If: `(<${inner}x>)` },
 			body: 'x',
 		});
 		expect(corrupt.status).toBe(423);
+		// An expired foreign token in our format is lock-shaped too → 423.
+		const foreign = await request('/a.txt', {
+			method: 'PUT',
+			headers: { If: '(<opaquelocktoken:00000000-0000-0000-0000-000000000000:123>)' },
+			body: 'x',
+		});
+		expect(foreign.status).toBe(423);
 		// A valid token passes.
 		const valid = await request('/a.txt', { method: 'PUT', headers: { If: `(${token})` }, body: 'y' });
 		expect(valid.status).toBe(204);
+	});
+
+	it('UNLOCK with our own token after state loss succeeds gracefully', async () => {
+		const token = await lock('/a.txt');
+		resetDavVolatileState();
+		const res = await request('/a.txt', { method: 'UNLOCK', headers: { 'Lock-Token': token } });
+		expect(res.status).toBe(204);
 	});
 
 	it('If-evaluation: a stale etag fails with 412 even for the lock owner', async () => {

@@ -103,10 +103,11 @@ service from Cloudflare.
   - Dead props survive PROPFIND/PROPPATCH/MOVE/COPY/DELETE within the
     isolate, are keyed by expanded `{namespace}local` name, and are cleared
     on DELETE.
-- **PUT auto-creates missing parent collections** (Google Drive worker parity
-  for clients that PUT deep paths without MKCOL). RFC 4918 §9.7.2 says 409;
-  this is the one intentional litmus deviation (`basic/put_no_parent`).
-  MKCOL and MOVE/COPY destinations *do* enforce the RFC rule (409).
+- **Creation is RFC-strict**: MKCOL, PUT and MOVE/COPY all require an
+  existing parent collection (`409` otherwise, RFC 4918 §9.3.1/§9.7.1/§9.9.3).
+  The Google Drive worker auto-creates parents on PUT/MKCOL instead; this
+  worker follows the RFC (litmus `basic` 16/16) — clients build the tree
+  level by level, which every mainstream WebDAV client already does.
 - **Lazily re-minted dlinks / TTFB**: no isolate-global dlink cache yet; would
   be a worker optimization (cache signed URLs up to min(1 h, 8 h) expiry).
 - **No parallel-range bandwidth gain**: limited by the CDN path cap, not by the

@@ -98,11 +98,10 @@ describe('mounted root (ROOT_ID=/sub)', () => {
 		expect(tb.nodes.has('/new.txt')).toBe(false);
 	});
 
-	it('PUT creates missing parents under the mount root', async () => {
+	it('PUT with a missing parent is 409 under the mount root', async () => {
 		const res = await request('/dav/deep/new.txt', { method: 'PUT', body: 'x' });
-		expect(res.status).toBe(201);
-		expect(tb.nodes.has('/sub/deep')).toBe(true);
-		expect(tb.nodes.has('/sub/deep/new.txt')).toBe(true);
+		expect(res.status).toBe(409);
+		expect(tb.nodes.has('/sub/deep')).toBe(false);
 	});
 
 	it('MKCOL creates folders inside the mount', async () => {
