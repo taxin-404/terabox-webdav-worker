@@ -16,7 +16,12 @@ cookie.
   mkdir, download links, filemanager ops (with async copy polling) and
   chunked uploads.
 - `src/webdav.ts` — RFC 4918 surface (PROPFIND / MKCOL / GET / PUT / DELETE /
-  MOVE / COPY) mapped over `TeraboxClient`.
+  MOVE / COPY / LOCK / UNLOCK / PROPPATCH) mapped over `TeraboxClient`.
+- `src/davxml.ts` — XML validation and namespace self-containment helpers
+  for PROPFIND/PROPPATCH bodies (malformed input → 400, never silent).
+- `src/davstate.ts` — advisory state (lock records + dead properties) behind
+  the `DavStore` interface: the `DavState` Durable Object (one serialized
+  instance shared by every isolate) with per-isolate memory fallback.
 - `src/index.ts` — entry point with basic auth that fails closed when `USERS`
   or `COOKIE` is unset.
 
@@ -33,6 +38,11 @@ Create the Worker with these secrets/vars:
 | `MIN_GAP_MS` | `400` | optional rate pacing between Terabox calls (default `400`; bclone parity) |
 | `PATH` | `/dav/` | optional base path the WebDAV is served under (gdrive parity): requests outside it 404, the bare base 301s to `/dav/`, hrefs include it |
 | `ROOT_ID` | `/backup` | optional Terabox folder mounted as the WebDAV root (gdrive parity; Terabox keys folders by path): clients see only that subtree |
+
+`PATH`/`ROOT_ID` are **per-instance**: set them in your own dashboard
+(Workers → your Worker → Settings → Variables). They are deliberately not
+committed to `wrangler.toml` — each deployment of this repo carries its own
+values — and `keep_vars = true` guarantees every deploy preserves them.
 
 ```sh
 wrangler secret put USERS
@@ -62,8 +72,10 @@ The Worker auto-deploys from Git: the dashboard's Git integration watches
    npm ci --legacy-peer-deps
    ```
 6. In the created Worker → **Settings → Variables and Secrets**, add the
-   secrets (`USERS`, `COOKIE`, optionally `JSTOKEN`) and variables
-   (`TERABOX_DOMAIN`, `MIN_GAP_MS`).
+   secrets (`USERS`, `COOKIE`, optionally `JSTOKEN`) and any per-instance
+   vars (`PATH`, `ROOT_ID`, `LOG_PREFIX`). Shared defaults (`TERABOX_DOMAIN`,
+   `MIN_GAP_MS`) ship in `wrangler.toml` `[vars]`; dashboard-only vars are
+   preserved on deploy via `keep_vars = true`.
    Dashboard deploys do not read `.dev.vars` or `wrangler secret put`.
 
 Every `git push origin main` triggers a deploy.
@@ -80,6 +92,7 @@ rclone config create terabox webdav \
 
 Uploads are buffered in memory and sent as Terabox chunks. Free accounts are
 capped at 4 GiB files (error 58 beyond that); premium accounts up to 128 GiB.
+If you set `PATH`, append it to the URL (e.g. `url = .../dav/`).
 
 ## Limitations
 
@@ -87,7 +100,9 @@ capped at 4 GiB files (error 58 beyond that); premium accounts up to 128 GiB.
   workers); infinite-depth listings are not crawled.
 - Files download through a Terabox CDN link with `Range` support; HEAD only
   examines metadata.
-- No lock tokens; LOCK/UNLOCK is not implemented (rclone doesn't need it).
+- Real RFC 4918 locks (LOCK/UNLOCK with 423 enforcement, `If` evaluation,
+  lockdiscovery) and dead properties, backed by the `DavState` Durable
+  Object when bound (per-isolate memory fallback otherwise).
 
 ## Development
 
@@ -96,7 +111,7 @@ Commands for local build, review and deploy:
 ```sh
 npm install --legacy-peer-deps   # wrangler pins + sharp override
 npm run typecheck                # tsc --noEmit
-npm test                         # 40 tests over the mock Terabox API
+npm test                         # 125 tests over the mock Terabox API
 npm run review                   # typecheck + dry-run deploy (no upload)
 npm run dev                      # local wrangler dev server (localhost:8787)
 npm run deploy                   # wrangler deploy (push to production)

@@ -4,14 +4,20 @@ compatibility_date = "2024-12-01"
 workers_dev = true
 preview_urls = true
 
+# Preserve dashboard-only plain-text vars across every deploy. Per-instance
+# config (PATH, ROOT_ID, LOG_PREFIX — each deployer's own values) lives in
+# THEIR dashboard, never in this shared file, and must not be wiped when a
+# push re-deploys. Secrets are never deleted by deploys either way.
+keep_vars = true
+
 [observability]
 enabled = true
 
-# Non-sensitive runtime config lives HERE, so every deployment re-applies it.
-# Wrangler's default deletes all dashboard-only plain-text vars before each
-# deploy (see --keep-vars); secrets are never deleted — so CREDENTIALS
-# (USERS/COOKIE/JSTOKEN) must be set as *Secrets* in the dashboard only:
-# this repo is public, never put them here.
+# Shared non-sensitive defaults live HERE, so every deployment re-applies
+# them. Per-instance vars stay in each deployer's dashboard (preserved via
+# `keep_vars = true` above). CREDENTIALS (USERS/COOKIE/JSTOKEN) must be set
+# as *Secrets* in the dashboard only: this repo is public, never put them
+# here as plain text.
 [vars]
 TERABOX_DOMAIN = "https://dm.terabox.com"
 MIN_GAP_MS = "400"
@@ -26,11 +32,11 @@ MIN_GAP_MS = "400"
 name = "DAV_STATE"
 class_name = "DavState"
 
-# The class already exists (created in the dashboard: namespace `dav-state`,
-# SQLite), so it is declared as a live export rather than via a migration —
-# `new_sqlite_classes` would try to create it again and the server would
-# reject the duplicate. If the class is ever deleted, drop this [exports]
-# block and add a [[migrations]] tag with `new_sqlite_classes = ["DavState"]`.
+# The class already exists on this account (pre-created in the dashboard:
+# namespace `dav-state`, SQLite). The [exports] entry below declares its
+# lifecycle — wrangler reconciles exports on every deploy, creating the
+# class automatically on fresh accounts. `migrations` and `exports` are
+# mutually exclusive, so no [[migrations]] block may coexist with it.
 [exports.DavState]
 type = "durable-object"
 storage = "sqlite"
