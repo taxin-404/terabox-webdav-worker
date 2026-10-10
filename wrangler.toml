@@ -58,8 +58,8 @@ storage = "sqlite"
 # ROOT_ID; Terabox identifies folders by path), e.g. only expose /backup:
 # vars = { ROOT_ID = "/backup" }
 
-# Comma or newline separated "user:password". Reject all requests when unset.
-# vars = { USERS = "user:pass" }
-
-# Terabox session cookie. Full cookie string or bare "ndus" value.
-# vars = { COOKIE = "ndus=...; lang=en" }
+# USERS and COOKIE are Secrets — set them per-instance in the dashboard
+# (Settings → Variables and Secrets) or with `wrangler secret put`, never
+# as commented-out vars in this public file. The Terabox cookie must be the
+# FULL browser cookie string (ndus + stoken + …); a bare ndus value is
+# gated by Terabox now (400141). See README "Setup".

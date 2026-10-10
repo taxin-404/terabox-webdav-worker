@@ -15,5 +15,5 @@
     "forceConsistentCasingInFileNames": true,
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "wrangler.toml.d.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts"]
 }

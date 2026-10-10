@@ -1,8 +1,10 @@
 import { defineConfig } from 'vitest/config';
 import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
 
+// Match wrangler.toml's compatibility_date so tests exercise the same
+// runtime semantics as production deploys.
 const compat = {
-	compatibilityDate: '2026-04-15',
+	compatibilityDate: '2024-12-01',
 };
 
 const davBindings = {

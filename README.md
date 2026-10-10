@@ -115,7 +115,10 @@ https://your-worker.workers.dev/dav/ /mnt/terabox davfs noauto,user,uid=1000,gid
 
 `mount /mnt/terabox` then works without sudo. Credentials live in
 `~/.davfs2/secrets` (or `/etc/davfs2/secrets` for system-wide mounts), one
-line per URL: `URL user:password`.
+line per URL with three whitespace-separated fields: `URL user password`
+(davfs2's parser does **not** split `user:password` on a colon — that form
+parses as a username-only entry and triggers an interactive password
+prompt).
 
 davfs2's access pattern shapes how the mount feels:
 
@@ -168,12 +171,14 @@ Commands for local build, review and deploy:
 ```sh
 npm install --legacy-peer-deps   # wrangler pins + sharp override
 npm run typecheck                # tsc --noEmit
-npm test                         # 125 tests over the mock Terabox API
-npm run review                   # typecheck + dry-run deploy (no upload)
+npm test                         # 173 tests over the mock Terabox API
+npm run review                   # typecheck + tests + dry-run deploy (no upload)
 npm run dev                      # local wrangler dev server (localhost:8787)
 npm run deploy                   # wrangler deploy (push to production)
 ```
 
 The test-suite mocks the Terabox API behind a stubbed global fetch, so the
 whole stack (auth, routing, WebDAV, uploads) is exercised without a real
-account. You still need a real `ndus` cookie to try a live account.
+account. You still need a real Terabox session cookie to try a live account —
+the **full** browser cookie string (a bare `ndus` value is gated by Terabox
+now; `stoken` matters for uploads).

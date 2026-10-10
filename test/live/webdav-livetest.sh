@@ -94,10 +94,14 @@ check "COPY self 403" 403 "$(code -u "$AUTH" -X COPY -H "Destination: $URL$T/c.t
 check "MOVE no-dest 400" 400 "$(code -u "$AUTH" -X MOVE "$URL$T/b.txt")"
 check "MOVE missing 404" 404 "$(code -u "$AUTH" -X MOVE -H "Destination: $URL$T/z.txt" "$URL$T/nope.txt")"
 
-check "PUT nested auto-parent 201" 201 "$(code -u "$AUTH" -X PUT -d 'nested' "$URL$T/sub/deep/file.txt")"
+# RFC 4918 §9.1: PUT does not auto-create parents — missing parent is 409.
+check "PUT missing parent 409" 409 "$(code -u "$AUTH" -X PUT -d 'nested' "$URL$T/sub/deep/file.txt")"
+check "MKCOL sub 201" 201 "$(code -u "$AUTH" -X MKCOL "$URL$T/sub")"
+check "MKCOL deep 201" 201 "$(code -u "$AUTH" -X MKCOL "$URL$T/sub/deep")"
+check "PUT nested after MKCOLs 201" 201 "$(code -u "$AUTH" -X PUT -d 'nested' "$URL$T/sub/deep/file.txt")"
 check "nested PROPFIND 207" 207 "$(code -u "$AUTH" -X PROPFIND -H 'Depth: 0' "$URL$T/sub/deep/file.txt")"
 
-check "MKCOL sub 201" 201 "$(code -u "$AUTH" -X MKCOL "$URL$T/movedir")"
+check "MKCOL movedir 201" 201 "$(code -u "$AUTH" -X MKCOL "$URL$T/movedir")"
 check "PUT in subdir 201" 201 "$(code -u "$AUTH" -X PUT -d 'in' "$URL$T/movedir/x.txt")"
 check "MOVE dir 201" 201 "$(code -u "$AUTH" -X MOVE -H "Destination: $URL$T/movedir2" "$URL$T/movedir")"
 check "moved child visible" 200 "$(code -u "$AUTH" "$URL$T/movedir2/x.txt")"

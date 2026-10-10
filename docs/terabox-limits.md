@@ -67,7 +67,8 @@ service from Cloudflare.
   `bdstoken` + WEB UA/APP ID (web-app parity).
 - **Chunks**: files split by `getChunkSize()`; each chunk POSTs to the chosen
   cluster, then `create` verifies `block_list` (per-chunk md5 + upload md5).
-  Hash mismatch → `-32`.
+  The worker re-computes the control md5 itself and raises `-5` (→ 502) on
+  mismatch; upstream `-32` is "space insufficient" (→ 507).
 - **`rtype` semantics** (filemanager): `0` = wait for sync, `1` = adaptive
   (returns before completion — the worker passes `rtype=1` and polling
   reconciles), `2` = pure async.
@@ -130,7 +131,7 @@ service from Cloudflare.
 |---|---|
 | ok (`0`) | 2xx |
 | `-10` out of space (precreate) | 507 |
-| `-32` chunk hash mismatch | 400 |
+| `-32` out of space (upload) | 507 |
 | `need verify` / `400141` / `450016` on a download | 401 (`step: dlink@<host>`) |
 | `2/check/login` | 401 |
 | `31045` wrong region | 502 |
