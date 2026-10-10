@@ -405,6 +405,27 @@ describe('RFC 4918 conformance', () => {
 		expect(res.headers.get('Content-Range')).toContain('/');
 	});
 
+	it('answers 416 for any range starting at or beyond EOF', async () => {
+		// Validated locally against itemInfo's size: no CDN round-trip whose
+		// out-of-bounds verdict varies by cluster (some answer 400141 gates).
+		const size = tb.find('/a.txt')!.size;
+		const res = await request('/a.txt', { headers: { Range: `bytes=${size}-${size + 5}` } });
+		expect(res.status).toBe(416);
+		expect(res.headers.get('Content-Range')).toBe(`bytes */${size}`);
+	});
+
+	it('honours a suffix range (bytes=-4)', async () => {
+		const res = await request('/a.txt', { headers: { Range: 'bytes=-4' } });
+		expect(res.status).toBe(206);
+		expect(await res.text()).toBe('fox\n');
+	});
+
+	it('ignores a malformed Range and serves the full entity', async () => {
+		const res = await request('/a.txt', { headers: { Range: 'kilobytes=0-2' } });
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe('the quick brown fox\n');
+	});
+
 	it('304s on a matching If-None-Match without a body', async () => {
 		const md5 = tb.find('/a.txt')!.md5;
 		const res = await request('/a.txt', { headers: { 'If-None-Match': `"${md5}"` } });

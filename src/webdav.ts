@@ -551,6 +551,33 @@ async function handleGet(request: Request, client: TeraboxClient, absPath: strin
       : !Number.isNaN(Date.parse(ifRange)) && lastModifiedMs <= Date.parse(ifRange);
     if (!fresh) range = null;
   }
+  if (range) {
+    // Validate against the size itemInfo already gave us: an unsatisfiable
+    // range answers 416 authoritatively without touching the ladder. (The
+    // CDN verdict for out-of-bounds ranges varies by cluster — some answer
+    // 400141 gates — and the fallback dlinks are gated anyway.) Anything we
+    // can't parse is ignored and the full entity is served (RFC 7233 §3.1).
+    const spec = /^bytes=(\d*)-(\d*)$/.exec(range);
+    const size = item.size || 0;
+    let unsatisfiable = false;
+    if (!spec || (spec[1] === '' && spec[2] === '')) {
+      range = null;
+    } else if (spec[1] === '') {
+      const suffix = Number(spec[2]);
+      unsatisfiable = suffix === 0 || size === 0;
+    } else {
+      unsatisfiable = Number(spec[1]) >= size;
+    }
+    if (unsatisfiable) {
+      return new Response(null, {
+        status: 416,
+        headers: {
+          ...Object.fromEntries(headers),
+          'Content-Range': `bytes */${size}`,
+        },
+      });
+    }
+  }
 
   let lastError: unknown = new TeraboxError(-5, 'No usable download link');
   /** Try one candidate; resolves the ready-to-stream Response or records why it failed. */

@@ -186,10 +186,19 @@ export class MockTerabox {
 			const bytes = node.content ?? new Uint8Array(0);
 			const range = req.headers.get('Range');
 			if (range) {
-				const m = /^bytes=(\d+)-(\d*)$/.exec(range);
-				if (m) {
-					const start = Number(m[1]);
-					const end = m[2] === '' ? bytes.byteLength - 1 : Math.min(Number(m[2]), bytes.byteLength - 1);
+				const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+				if (m && (m[1] !== '' || m[2] !== '')) {
+					let start: number;
+					let end: number;
+					if (m[1] === '') {
+						// Suffix range: the last N bytes.
+						const suffix = Number(m[2]);
+						start = Math.max(0, bytes.byteLength - suffix);
+						end = bytes.byteLength - 1;
+					} else {
+						start = Number(m[1]);
+						end = m[2] === '' ? bytes.byteLength - 1 : Math.min(Number(m[2]), bytes.byteLength - 1);
+					}
 					if (start >= bytes.byteLength || start > end) {
 						// RFC 7233: unsatisfiable → 416 with the total size.
 						return new Response(null, {
