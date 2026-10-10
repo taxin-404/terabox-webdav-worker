@@ -104,6 +104,39 @@ Uploads are buffered in memory and sent as Terabox chunks. Free accounts are
 capped at 4 GiB files (error 58 beyond that); premium accounts up to 128 GiB.
 If you set `PATH`, append it to the URL (e.g. `url = .../dav/`).
 
+## davfs2 usage
+
+Non-root davfs2 mounts require an `/etc/fstab` entry (davfs2's own rule, not a
+worker limitation):
+
+```
+https://your-worker.workers.dev/dav/ /mnt/terabox davfs noauto,user,uid=1000,gid=1000 0 0
+```
+
+`mount /mnt/terabox` then works without sudo. Credentials live in
+`~/.davfs2/secrets` (or `/etc/davfs2/secrets` for system-wide mounts), one
+line per URL: `URL user:password`.
+
+davfs2's access pattern shapes how the mount feels:
+
+- **One whole-file `GET` per open** — davfs2 never sends `Range` requests;
+  `open()` streams the entire file into its local cache and every later read
+  is local. Small and medium files are quick; opening a multi-gigabyte video
+  downloads all of it first (tens of minutes) — use rclone for those.
+- **Revalidation is cheap** — davfs2 re-opens with `If-None-Match` and the
+  worker answers `304 Not Modified`, so a cached file re-opens with no body.
+- **`~/.davfs2/davfs2.conf`** reduces chatter:
+
+  ```
+  delay_upload 0    # default 10: write back on close, not 10 s later
+  gui_optimize 1    # one PROPFIND per directory instead of per-file stats
+  use_locks 0       # skip advisory LOCK round-trips
+  buf_size 64       # 16: larger kernel read/write buffer
+  ```
+
+- **`lost+found/`** in the mount view is a davfs2 built-in directory for
+  failed uploads. It exists only in the client's view, never on the server.
+
 ## Limitations
 
 - Non-zero `Depth` PROPFIND returns children (same policy as the drive WebDAV
