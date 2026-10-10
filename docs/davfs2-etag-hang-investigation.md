@@ -3,7 +3,7 @@
 Status: **root cause observed on the wire (2026-10-10, third pass) — it is a
 davfs2 client-side `cache_size` purge, not a worker fault.** The 206/etag
 mechanism this document originally pursued is a *real* latent robustness bug
-(fixed on `fix/davfs2-etag-hang`) but was **not** the cause of the observed
+(fixed on `main` since `35eb401`, deployed) but was **not** the cause of the observed
 re-download loop. Originally written 2026-10-10 as a handoff; a second pass
 re-verified every load-bearing davfs2 claim against the Debian master sources;
 a third pass closed the last link with a connected `wrangler tail`, the
@@ -41,9 +41,9 @@ source-verified** davfs2 footgun (a successful non-`200` GET frees the stored
 etag, `webdav.c:818-838`) and our old `webdav.ts` could in principle surface an
 unrequested `206` from the PCS upstream. But `wrangler tail --format json`
 directly observed the worker answering **`200`** to the daemon's GETs, so that
-path was **not** what looped here. It is fixed on `fix/davfs2-etag-hang` as
-RFC 7233 §4.1 conformance hardening and defence-in-depth, not as the root
-cause. See "Root cause (resolved)".
+path was **not** what looped here. It is fixed on `main` (merged `35eb401`,
+deployed) as RFC 7233 §4.1 conformance hardening and defence-in-depth, not as
+the root cause. See "Root cause (resolved)".
 
 ## Root cause (resolved, third pass 2026-10-10)
 
@@ -293,10 +293,10 @@ The mount re-open check is still the right way to verify the *config* fix.
    instantly. If it does, the loop is confirmed as "one bad status poisons the
    client forever" and the fix below is exactly right.
 
-## Conformance hardening (implemented on `fix/davfs2-etag-hang`) — not the root-cause fix
+## Conformance hardening (on production since `35eb401`) — not the root-cause fix
 
-The root-cause fix is the `cache_size` config change above. Separately, this
-branch hardens the worker against the *latent* 206/etag footgun (a real RFC
+The root-cause fix is the `cache_size` config change above. Separately, the
+merged change hardens the worker against the *latent* 206/etag footgun (a real RFC
 7233 §4.1 violation and a genuine davfs2 etag-poisoning vector, even though it
 was not what looped here). Worth shipping as defence-in-depth and correctness:
 

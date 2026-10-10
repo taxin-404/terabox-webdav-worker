@@ -523,17 +523,17 @@ re-open → expect an instant open, **zero** cache-write `write(6,…)` calls in
 the daemon trace, and a quiet `journalctl -g 'max cache size'`.
 
 The 206/etag footgun chased in the earlier passes is real (source-verified: a
-successful non-`200` frees davfs2's stored etag) and is fixed on this branch
-as RFC 7233 §4.1 conformance hardening — defence-in-depth, not this
+successful non-`200` frees davfs2's stored etag) and is fixed on `main`
+since `35eb401` as RFC 7233 §4.1 conformance hardening — defence-in-depth, not this
 incident's cause. Full write-up: `docs/davfs2-etag-hang-investigation.md`.
 
 ## Repo map (context for AI sessions)
 
-Branch state (2026-10-10): `main` = production (auto-deploys on push; litmus
-105/105, 142 unit tests). `fix/davfs2-etag-hang` = the RFC 7233 GET/ETag
-conformance hardening + this root-cause write-up (pending review — gates
-green, not yet merged/deployed). Gates before any push to `main`:
-`npm run typecheck && npm test -- --run && npx wrangler deploy --dry-run`.
+Branch state (2026-10-10): `main` = production, auto-deploys on push (litmus
+105/105, 142 unit tests); it includes the RFC 7233 GET/ETag conformance
+hardening (merged `35eb401`, deployed) and this root-cause write-up.
+`fix/davfs2-etag-hang` is merged and can be deleted. Gates before any push to
+`main`: `npm run typecheck && npm test -- --run && npx wrangler deploy --dry-run`.
 
 - `taxin-404/terabox-webdav-worker` — this project (TypeScript Worker)
 - `BenjiThatFoxGuy/bclone` — rclone fork; the Terabox backend ported here
