@@ -89,29 +89,31 @@ service from Cloudflare.
 
 ## 6. What is *not* a TeraBox limit (worker-side design)
 
-- **WebDAV locks & dead properties are per-isolate, in-memory state.** The
-  worker has no storage binding, so LOCK records and PROPPATCH-set dead props
-  live in the isolate that handled the request. Consequences, all deliberate:
-  - Locks are **real**: un-tokened writes to a locked resource answer `423`,
-    UNLOCK validates its token (`409`), `lockdiscovery` reports the active
-    lock, shared locks stack, refresh works through `Depth: Infinity`
-    ancestors, and `If` headers are evaluated (`412`/`423`).
-  - After isolate rotation the state is gone. Enforcement then *relaxes*
-    (an empty store allows the write), and a self-issued lock token stays
-    valid for the rest of its embedded expiry — UNLOCK even answers `204`
-    gracefully for such a token — so warm clients (Windows, litmus) are never
-    bricked mid-session. Worst case a client re-locks.
-  - Dead props survive PROPFIND/PROPPATCH/MOVE/COPY/DELETE within the
-    isolate, are keyed by expanded `{namespace}local` name, and are cleared
-    on DELETE.
-  - **Measured effect on litmus** (2026-10-10): the `locks` suite passes
-    ~31–35/38 per run; the sporadic failures are symmetric isolate-hop
-    artifacts (a request seeing an empty store *or* a stale one), never a
-    protocol-logic error. Real traffic is unaffected. The deterministic
-    upgrade path is a **Durable Object** holding lock/prop state: one
-    dashboard resource + a `[[durable_objects.bindings]]` entry + migration
-    tag; everything else (handler logic) is already written against the
-    `LOCKS`/`DEAD_PROPS` maps and would keep working unchanged behind it.
+- **WebDAV locks & dead properties are Durable-Object-backed (2026-10-10
+  upgrade).** All advisory state lives behind a `DavStore` interface
+  (`src/davstate.ts`) with two implementations sharing one set of pure core
+  functions, so semantics cannot drift:
+  - **`RemoteDavStore` + `DavState` DO (default when `DAV_STATE` is bound)**:
+    one serialized instance per account (`idFromName('terabox-dav-state')`),
+    write-through SQLite storage. Every WebDAV isolate talks to the same
+    object, so Cloudflare's isolate scheduling cannot make lock enforcement
+    or dead-prop reads flaky — this removed the last conformance flake
+    (measured: three consecutive `locks` runs at **40/40** after the DO,
+    versus zero clean runs in five attempts before it; full suite
+    **105/105**).
+  - **`MemoryDavStore` (fallback when no binding)**: the original
+    per-isolate maps, used automatically (tests, or if the binding is ever
+    removed). Enforcement *relaxes* across isolate hops (empty store allows
+    the write) and self-issued tokens carry their expiry, so clients are
+    never bricked; worst case a client re-locks.
+  - Locks are **real** in both: un-tokened writes to a locked resource
+    answer `423`, UNLOCK validates its token (`409`), `lockdiscovery`
+    reports the active lock, shared locks stack, refresh works through
+    `Depth: Infinity` ancestors, and `If` headers are evaluated
+    (`412`/`423`).
+  - Dead props are keyed by expanded `{namespace}local` name, migrate on
+    MOVE (+prefix for collections), copy on COPY, and are cleared on
+    DELETE — all through the same store API.
 - **Creation is RFC-strict**: MKCOL, PUT and MOVE/COPY all require an
   existing parent collection (`409` otherwise, RFC 4918 §9.3.1/§9.7.1/§9.9.3).
   The Google Drive worker auto-creates parents on PUT/MKCOL instead; this

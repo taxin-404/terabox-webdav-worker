@@ -318,9 +318,8 @@ Five measured runs: full suite 31/33 and 35/38; locks-only reruns 39/40,
 of `200`), and no ordering that a protocol-logic bug could produce. Real
 clients are never harmed by the hopping: an empty store *allows* writes
 (only enforcement relaxes), and lenient tokens cover UNLOCK. Making locks
-100 % deterministic under Cloudflare scheduling requires a Durable Object
-(dashboard resource + binding; noted as the upgrade path in
-`terabox-limits.md` §6).
+100 % deterministic under Cloudflare scheduling requires a Durable Object —
+**done in Campaign 4 below** (`28249d5`).
 
 ### Verification tooling
 
@@ -350,6 +349,56 @@ Live test directories purged through the worker after the campaign:
 `/litmus/` (litmus base), `/conf-test/`, leftover probe dirs from earlier
 batteries (`/probe/`, `/livetestlive/`, `/livetest3/`) and the empty
 `/rclone-test/`. Account root holds only real user data again.
+
+## Campaign 4 — Durable Object-backed state, litmus 105/105 (2026-10-10)
+
+The only failure left after Campaign 3 was environmental: lock/dead-prop
+state lived in per-isolate memory, so the occasional litmus request that
+Cloudflare routed to a different isolate saw a stale or empty store
+(~1–2 random misses per run, never the same test twice).
+
+### Implementation (`28249d5`)
+
+- New `src/davstate.ts`: a `DavStore` interface with two implementations
+  backed by **one set of pure core functions** (semantics cannot drift):
+  - `RemoteDavStore` + `DavState extends DurableObject` — one serialized
+    instance per account (`idFromName('terabox-dav-state')`), write-through
+    SQLite storage, JSON routes (`/tokens`, `/lock`, `/unlock`, `/describe`,
+    `/patch`, `/relocate`). Every worker isolate talks to this single
+    object, so scheduling becomes irrelevant to lock semantics.
+  - `MemoryDavStore` — the previous maps, used automatically when no
+    binding is present (tests, fallback).
+- `src/webdav.ts` refactored onto async store calls; HTTP behavior is
+  byte-identical (the 125-test suite passed unchanged on the first run).
+- `index.ts` re-exports `DavState` (required for the binding) and passes
+  `createDavStore(env)` per request; `env.DAV_STATE` is optional.
+- `wrangler.toml`: `[[durable_objects.bindings]] name = "DAV_STATE"` +
+  a live `[exports.DavState]` entry (`type = "durable-object"`,
+  `storage = "sqlite"`). **No `[[migrations]]` block**: the class was
+  pre-created in the dashboard (namespace `dav-state`), and
+  `new_sqlite_classes` would be rejected as a duplicate — a binding to an
+  existing class needs no migration. Wrangler also rejects
+  `existing_sqlite_classes` (unknown field since 4.146).
+
+### Results (live, after deploy)
+
+| Run | Result |
+|---|---|
+| locks ×1 | **40/40** |
+| locks ×2 | **40/40** |
+| locks ×3 | **40/40** |
+| full (basic/copymove/props/locks/http) | **16/16 · 13/13 · 33/33 · 40/40 · 3/3 = 105/105** |
+
+For comparison, the per-isolate build produced **zero** clean locks runs in
+five measured attempts (31/33, 35/38, 39/40, 23/25, 38/40). Three
+consecutive perfect runs plus a perfect full suite = the flake is gone;
+**litmus is now 105/105 with zero failures and zero warnings.**
+
+### Cleanup
+
+`/litmus/` purged again through the worker after the campaign (204); account
+root verified to hold only user data (BackupFolder, backup, entertainment,
+hacking, mern, omacom, tools).
 
 ## Repo map (context for AI sessions)
 
