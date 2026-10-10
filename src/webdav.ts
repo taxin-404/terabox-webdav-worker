@@ -885,12 +885,18 @@ async function ensureParent(client: TeraboxClient, absPath: string): Promise<voi
   }
 }
 
-export function errorResponse(message: string, status: number, extra?: Record<string, unknown>): Response {
+export function errorResponse(
+  message: string,
+  status: number,
+  extra?: Record<string, unknown>,
+  headers?: Record<string, string>,
+): Response {
   return new Response(JSON.stringify({ error: message, ...extra }), {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store',
+      ...headers,
     },
   });
 }

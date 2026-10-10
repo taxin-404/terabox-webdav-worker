@@ -92,7 +92,11 @@ const worker: ExportedHandler<Env> = {
       if (reqIsPreflight(request)) {
         return new Response(null, { status: 204 });
       }
-      return errorResponse('Unauthorized', 401);
+      // RFC 7235 §3.1: a 401 must carry the challenge or clients (neon/
+      // litmus, Windows Mini-Redirector) never send their credentials.
+      return errorResponse('Unauthorized', 401, undefined, {
+        'WWW-Authenticate': 'Basic realm="terabox WebDAV", charset="UTF-8"',
+      });
     }
 
     const client = new TeraboxClient(env.COOKIE, env.TERABOX_DOMAIN, {
