@@ -122,7 +122,10 @@ davfs2's access pattern shapes how the mount feels:
 - **One whole-file `GET` per open** — davfs2 never sends `Range` requests;
   `open()` streams the entire file into its local cache and every later read
   is local. Small and medium files are quick; opening a multi-gigabyte video
-  downloads all of it first (tens of minutes) — use rclone for those.
+  downloads all of it first (measured ~1.5 MB/s through this worker, i.e.
+  roughly ten minutes per gigabyte — and the mount is unresponsive to
+  everything else meanwhile, davfs2 being single-threaded) — use rclone for
+  those.
 - **Revalidation is cheap** — davfs2 re-opens with `If-None-Match` and the
   worker answers `304 Not Modified`, so a cached file re-opens with no body.
 - **`~/.davfs2/davfs2.conf`** reduces chatter:

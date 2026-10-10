@@ -400,6 +400,90 @@ consecutive perfect runs plus a perfect full suite = the flake is gone;
 root verified to hold only user data (BackupFolder, backup, entertainment,
 hacking, mern, omacom, tools).
 
+## Campaign 5 — live mount campaign: path fix, metadata cache, davfs2 model (2026-10-10)
+
+Scope: end-to-end testing through a real davfs2 mount of the live worker,
+prompted by two field reports — files with `+` in the name 404'd for davfs2,
+and large-file reads through the mount "hung forever".
+
+### Fixes shipped
+
+- `99e589a` — `decodePathname` applied form-encoding (`+` → space) to URL
+  *path* segments; a literal `+` in a file name (e.g. `Hindi 5.1+English
+  5.1...mkv`) broke lookup for every client that sends it raw (davfs2,
+  browsers). Now plain `decodeURIComponent` per RFC 3986 (drive-worker
+  parity). Live-verified after deploy: raw-`+` GET 404→206, PROPFIND 404→207.
+  Five regression tests (raw `+`, `%2B`, `%20`, PROPFIND hrefs, MOVE).
+- `99e589a` — lockdiscovery used `Math.floor` of the remaining ms, so a
+  fresh `Second-3600` lock intermittently rendered `Second-3599` (observed
+  2/5 runs); `Math.ceil` makes it deterministic (130/130 ×3).
+- `17c7b12` — read-path metadata cache (Google Drive worker parity, 60 s
+  TTL). Every read paid a paced `filemetas` round-trip (~0.7-0.9 s of the
+  ~2.4 s measured per request), and davfs2 stats paths constantly. The
+  dlink-flavoured fill is shared by `statResource` and `handleGet`; writes
+  invalidate exact path + subtree + parent; negatives are never cached;
+  `resetDavVolatileState` clears it for test isolation. Live proof: first
+  PROPFIND of a never-touched path 482 ms → second 105 ms (pure cache).
+  136/136 tests.
+
+### davfs2 behaviour: the "hang" is a design property, not a wedge
+
+> Follow-up deep dive (full strace, per-window byte accounting, request-record
+> forensics): the1.1 GB re-open hangs turned out to be **repeated whole-file
+> re-downloads**, one of them restarting from zero after a CDN stall tripped
+> davfs2's 180 s read timeout — plus an etag-capture quirk that can lock a
+> davfs2 client into bare-GET revalidations forever. Full evidence, the
+> designed fix, and handoff recipes:
+> `docs/davfs2-etag-hang-investigation.md`.
+
+Established from the davfs2 source (Debian sid tree) plus a full `strace -f`
+of the live daemon during a mount read:
+
+- davfs2 **never sends `Range` requests** (none in its own code; neon's
+  `bytes=%ld-%ld` strings are unused capability). `open()` performs **one
+  whole-file `GET`** — revalidated with `If-None-Match` after
+  `file_refresh` (1 s; the worker answers `304`, so cached re-opens are
+  free) — streamed into the local cache file (`update_cache_file` →
+  `dav_get_file` → `file_reader`); every later read is a local `pread`.
+- The FUSE loop is **single-threaded**: a large `open()` blocks the entire
+  filesystem until the download completes. A 1,126,762,632-byte video
+  measured **515 MB in 348 s ≈ 1.5 MB/s** through the worker (strace cache
+  writes `write(6,…)` accounting), i.e. `open()` ≈ 12 minutes — during
+  which even `stat` of *other* files queues behind it. That is the entire
+  "wedge" story: earlier "zero packets" observations were filter artifacts
+  (`ss` matched only the worker-edge IP; the stream goes to the TeraBox
+  CDN host) and one broken tail session.
+- `lost+found/` in the mount view is a davfs2 built-in
+  (`DAV_BACKUP_DIR` in `defaults.h`) for failed uploads — it exists only
+  in the client's view, never on the server.
+
+### Client-side facts (now in README "davfs2 usage")
+
+- Non-root mounts need an `/etc/fstab` `user` entry **and** membership in
+  dav_group (`network` on Arch); `mount(8)` appears to drop supplementary
+  groups in the helper chain — making `network` the *primary* group is the
+  reliable fix.
+- `mount.davfs` refuses to run non-setuid (`geteuid() != 0` → abort), so
+  debug tracing requires `sudo strace -f`.
+- Secrets format is whitespace-separated `URL user password`; this build's
+  parser (`read_secrets`/`parse_line`) does **not** split `user:pass` on a
+  colon — such a line parses as username-only and triggers the interactive
+  password prompt (EOF → SIGABRT when no tty).
+- Defaults worth tuning for a snappy mount: `buf_size 64` (16),
+  `delay_upload 0` (10), `gui_optimize 1` (0), `use_locks 0` (1).
+
+### Live session results (through the mount)
+
+- Healthy read: `bookmarks_7_23_26.html` (26,698 B) in 3.9 s, byte-identical
+  to a direct GET.
+- `+`-named video: 206/207 via direct HTTP; ~1.5 MB/s whole-file stream
+  through the mount (progress proven live in the daemon trace).
+- Write probes (server-verified via direct API): MKCOL/PUT/file-MOVE/dir-MOVE
+  201/204, deletes clean; rename issued milliseconds after create returns EIO
+  (davfs `delay_upload` interplay, server state correct either way).
+- `wrangler tail` proved flaky this session (two sessions captured
+  zero bytes); the daemon-side `strace` was the reliable channel.
+
 ## Repo map (context for AI sessions)
 
 - `taxin-404/terabox-webdav-worker` — this project (TypeScript Worker)
