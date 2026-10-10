@@ -32,6 +32,10 @@ export interface MockNode {
 	isdir: number;
 	size: number;
 	server_mtime: number;
+	/** Optional client-visible timestamps — real list entries sometimes carry
+	 *  these INSTEAD of server_mtime; the worker must fall back to them. */
+	mtime?: number;
+	ctime?: number;
 	md5: string;
 	fs_id?: string;
 	content?: Uint8Array;
@@ -52,6 +56,16 @@ export class MockTerabox {
 	/** Test knobs: force an endpoint to fail with this errno (0 = healthy). */
 	membershipErrno = 0;
 	precreateErrno = 0;
+	/** Force the whole /api/filemetas response to fail with this errno. */
+	filemetasErrno = 0;
+	/** Per-path /api/filemetas failures — lets a test make ONE stat fail
+	 *  (e.g. the PUT target) while its parent stays healthy. */
+	filemetasFailPaths = new Map<string, number>();
+	/** Every /api/list page answers a full `num` items forever — exercises
+	 *  the worker's 100-page truncation guard without seeding 10k files. */
+	listFullPages = false;
+	/** superfile2 chunk uploads observed — lets tests assert multi-chunk PUTs. */
+	superfile2Calls = 0;
 	/** Override locateupload's candidate server list (default: [UPLOAD_BASE host]). */
 	locateServers: string[] | null = null;
 	/** Hosts whose superfile2 answers HTTP 403 error_code 31045 "user not exists". */
@@ -129,6 +143,8 @@ export class MockTerabox {
 			server_filename: node.name,
 			size: node.size,
 			server_mtime: node.server_mtime,
+			...(node.mtime !== undefined ? { mtime: node.mtime } : {}),
+			...(node.ctime !== undefined ? { ctime: node.ctime } : {}),
 			md5: node.md5,
 			isdir: node.isdir,
 			...(withDlink ? { dlink: `${BASE}/dl/${encodeURIComponent(node.path)}` } : {}),
@@ -275,13 +291,35 @@ export class MockTerabox {
 			}
 			if (pathname === '/api/list' && method === 'GET') {
 				const dir = url.searchParams.get('dir') || '/';
-				return json({ errno: 0, list: this.children(dir).sort((a, b) => (a.name < b.name ? -1 : 1)).map((n) => this.wire(n)) });
+				const page = Number(url.searchParams.get('page') || '1');
+				const num = Number(url.searchParams.get('num') || '100');
+				const all = this.children(dir).sort((a, b) => (a.name < b.name ? -1 : 1));
+				const list = this.listFullPages
+					? // Synthesize an endless full page: same shape every time, never short.
+						Array.from({ length: num }, (_, i) => {
+							const src = all[i % Math.max(all.length, 1)];
+							if (src) return this.wire(src);
+							return this.wire({
+								path: `${dir === '/' ? '' : dir}/full-${i}`,
+								name: `full-${i}`,
+								isdir: 0,
+								size: 1,
+								server_mtime: 1704067200,
+								md5: '',
+								fs_id: String(900000 + i),
+							});
+						})
+					: all.slice((page - 1) * num, page * num).map((n) => this.wire(n));
+				return json({ errno: 0, list });
 			}
 			if (pathname === '/api/filemetas') {
 				this.filemetasCalls++;
+				if (this.filemetasErrno) return json({ errno: this.filemetasErrno, msg: 'simulated filemetas outage' });
 				const target = JSON.parse(url.searchParams.get('target') || '[]') as string[];
 				const dlink = url.searchParams.get('dlink') === '1';
 				const info = target.map((p) => {
+					const forced = this.filemetasFailPaths.get(p);
+					if (forced) return { errno: forced, path: p };
 					const node = this.nodes.get(p);
 					if (!node) return { errno: -9, path: p };
 					return this.wire(node, dlink);
@@ -324,14 +362,21 @@ export class MockTerabox {
 				for (const [, bytes] of sorted) total += bytes.byteLength;
 				const buf = new Uint8Array(total);
 				let offset = 0;
+				const chunkMd5s: string[] = [];
 				for (const [, bytes] of sorted) {
 					buf.set(bytes, offset);
 					offset += bytes.byteLength;
+					chunkMd5s.push(md5Hex(bytes));
 				}
 				const real = md5Hex(buf);
 				const node = this.seed(path, { isdir: 0, content: buf, server_mtime: Math.floor(Date.now() / 1000) });
 				node.md5 = real;
-				return json({ errno: 0, md5: encodeMD5(real), uploadid: uploadId });
+				// Live contract (bclone parity): a single-chunk create returns
+				// the file md5; a multi-chunk create returns the CONTROL md5 —
+				// md5 of the JSON array of per-chunk md5s — which is what the
+				// worker validates its chunk list against.
+				const wireMd5 = chunkMd5s.length === 1 ? real : md5Hex(new TextEncoder().encode(JSON.stringify(chunkMd5s)));
+				return json({ errno: 0, md5: encodeMD5(wireMd5), uploadid: uploadId });
 			}
 			if (pathname === '/api/precreate' && method === 'POST') {
 				if (this.precreateErrno) return json({ errno: this.precreateErrno, msg: 'simulated verify required' });
@@ -443,6 +488,7 @@ export class MockTerabox {
 			if (this.rejectHosts.has(url.hostname)) {
 				return json({ error_code: 31045, error_msg: 'user not exists' }, 403);
 			}
+			this.superfile2Calls++;
 			// The web client always echoes precreate's uploadsign back
 			// (e.uploadSign = o.uploadsign) — lock that contract here; live
 			// clusters reject mismatches with 31045 "user not exists".

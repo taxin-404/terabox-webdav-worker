@@ -46,6 +46,22 @@ export default defineConfig({
 				],
 				test: { name: 'auth', include: ['test/auth.test.ts'] },
 			},
+			{
+				// Same surface as `dav`, but with the DAV_STATE Durable Object
+				// bound: locks and dead props flow through RemoteDavStore →
+				// DavState.fetch, the deployment's real advisory-state path.
+				plugins: [
+					cloudflareTest({
+						main: 'src/index.ts',
+						miniflare: {
+							...compat,
+							bindings: davBindings,
+							durableObjects: { DAV_STATE: { className: 'DavState' } },
+						},
+					}),
+				],
+				test: { name: 'davstate', include: ['test/davstate.test.ts'] },
+			},
 		],
 	},
 });

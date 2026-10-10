@@ -96,9 +96,26 @@ export function validateXml(body: string): string | null {
   let i = 0;
   const n = body.length;
 
+  // A raw `&` must open a well-formed entity reference; anything else makes
+  // the document not XML (strict parsers reject it before we re-emit props).
+  const bareAmpOk = (text: string): boolean => {
+    let idx = text.indexOf('&');
+    while (idx !== -1) {
+      const rest = text.slice(idx);
+      if (!/^&(?:amp|lt|gt|apos|quot|#\d+|#x[0-9A-Fa-f]+);/.test(rest)) return false;
+      idx = text.indexOf('&', idx + 1);
+    }
+    return true;
+  };
+
   while (i < n) {
     const lt = body.indexOf('<', i);
-    if (lt === -1) break; // trailing text is fine
+    if (lt === -1) {
+      // trailing text is fine, but not a bare '&'
+      if (!bareAmpOk(body.slice(i))) return 'bare & entity';
+      break;
+    }
+    if (!bareAmpOk(body.slice(i, lt))) return 'bare & entity';
     if (body.startsWith('<!--', lt)) {
       const e = body.indexOf('-->', lt + 4);
       if (e === -1) return 'unterminated comment';
@@ -142,6 +159,9 @@ export function validateXml(body: string): string | null {
     }
     if (j >= n) return 'unterminated tag';
     const raw = body.slice(lt + 1, j);
+    // Inside a tag the only legal '&' is in an attribute value, and there it
+    // must still be an entity reference.
+    if (!bareAmpOk(raw)) return 'bare & entity';
     i = j + 1;
 
     if (raw.startsWith('/')) {

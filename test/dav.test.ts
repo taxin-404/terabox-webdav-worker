@@ -1,6 +1,6 @@
 import { SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { resetDavVolatileState } from '../src/webdav';
+import { metaCacheHasForTest, metaCacheSeedForTest, metaCacheSize, resetDavVolatileState } from '../src/webdav';
 import { AUTH, MockTerabox, ORIGIN, UPLOAD_BASE, installMock } from './helpers';
 
 let tb: MockTerabox;
@@ -479,13 +479,14 @@ describe('DELETE', () => {
 
 describe('MOVE / COPY', () => {
 	it('MOVE to a new destination returns 201', async () => {
+		const originalSize = tb.find('/a.txt')!.size;
 		const res = await request('/a.txt', {
 			method: 'MOVE',
 			headers: { Destination: ORIGIN + '/moved.txt' },
 		});
 		expect(res.status).toBe(201);
 		expect(tb.find('/a.txt')).toBeUndefined();
-		expect(tb.find('/moved.txt')?.size).toBe(tb.find('/moved.txt')?.size);
+		expect(tb.find('/moved.txt')?.size).toBe(originalSize);
 	});
 
 	it('MOVE with Overwrite replaces the target and returns 204', async () => {
@@ -1300,5 +1301,338 @@ describe('lock enforcement', () => {
 		// Unlock the collection; the child is free again.
 		expect((await request('/lockcoll', { method: 'UNLOCK', headers: { 'Lock-Token': token } })).status).toBe(204);
 		expect((await request('/lockcoll/file.txt', { method: 'PUT', body: 'free' })).status).toBe(204);
+	});
+});
+
+describe('audit hardening (Phase 2 regressions)', () => {
+	describe('path traversal containment', () => {
+		it('normalizes a percent-encoded ".." segment inside the path', async () => {
+			// %2e%2e decodes to the literal ".." and must get the identical
+			// cleanup as a raw dot-dot — never survive into the Terabox path.
+			const res = await request('/docs/%2e%2e/a.txt');
+			expect(res.status).toBe(200);
+			expect(await res.text()).toBe('the quick brown fox\n');
+		});
+
+		it('cannot climb above the root even with repeated %2e%2e', async () => {
+			const res = await request('/%2e%2e/%2e%2e/etc/passwd');
+			expect(res.status).toBe(404);
+			// The path normalized to /etc/passwd, it did NOT escape to a
+			// raw ".." path the upstream could walk with.
+			expect(tb.nodes.has('/etc/passwd')).toBe(false);
+		});
+
+		it('rejects a percent-encoded separator inside a segment (400)', async () => {
+			// %2F decodes to "/" — fabricating path structure the client
+			// never had a separator for. Must be refused, not guessed at.
+			const res = await request('/docs%2F..%2Fa.txt');
+			expect(res.status).toBe(400);
+		});
+
+		it('MOVE Destination with %2e%2e cannot escape either', async () => {
+			const res = await request('/a.txt', {
+				method: 'MOVE',
+				headers: { Destination: ORIGIN + '/docs/%2e%2e/escaped.txt' },
+			});
+			// Normalizes to /escaped.txt — a sibling, not an upstream walk.
+			expect(res.status).toBe(201);
+			expect(tb.find('/escaped.txt')).toBeDefined();
+			expect(tb.find('/docs/escaped.txt')).toBeUndefined();
+		});
+	});
+
+	describe('metadata cache cap', () => {
+		it('evicts the oldest entries once META_MAX_ENTRIES is exceeded', async () => {
+			// Seed 2005 entries through the same write path the live stat
+			// handler uses (cacheWrite: expiry sweep + FIFO cap). A per-entry
+			// HTTP round-trip would take ~90s; the one real HEAD below proves
+			// the live miss path lands in that same write.
+			const N = 2005;
+			const filler = { isdir: 0, size: 1, server_filename: 'x.txt' };
+			for (let i = 0; i < N; i += 1) {
+				metaCacheSeedForTest(`/cap-${i}.txt`, { ...filler, path: `/cap-${i}.txt` });
+			}
+			expect(metaCacheSize()).toBeLessThanOrEqual(2000);
+			// 2005 inserts, cap 2000: the first five (cap-0..cap-4) were
+			// FIFO-evicted during seeding; the oldest survivor is cap-5.
+			expect(metaCacheHasForTest('/cap-0.txt')).toBe(false);
+			expect(metaCacheHasForTest('/cap-4.txt')).toBe(false);
+			expect(metaCacheHasForTest('/cap-5.txt')).toBe(true);
+			// …while the newest entry survived.
+			expect(metaCacheHasForTest(`/cap-${N - 1}.txt`)).toBe(true);
+
+			// A real cache-miss HEAD re-fetches (filemetas) and writes through
+			// cacheWrite — evicting the next-oldest survivor, cap-5.
+			tb.seed('/live.txt', { content: 'x' });
+			expect((await request('/live.txt', { method: 'HEAD' })).status).toBe(200);
+			expect(metaCacheHasForTest('/live.txt')).toBe(true);
+			expect(metaCacheHasForTest('/cap-5.txt')).toBe(false);
+			// A second HEAD of the same path is a cache hit: no extra fetch.
+			const callsBefore = tb.filemetasCalls;
+			expect((await request('/live.txt', { method: 'HEAD' })).status).toBe(200);
+			expect(tb.filemetasCalls).toBe(callsBefore);
+		});
+	});
+
+	describe('If header bare forms (RFC 4918 §10.2.1)', () => {
+		const LOCK_BODY =
+			'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+			'<D:locktype><D:write/></D:locktype><D:owner><D:href>bare</D:href></D:owner></D:lockinfo>';
+
+		const lock = async (path: string): Promise<string> => {
+			const res = await request(path, {
+				method: 'LOCK',
+				headers: { 'Content-Type': 'application/xml' },
+				body: LOCK_BODY,
+			});
+			expect(res.status).toBe(200);
+			return res.headers.get('Lock-Token')!;
+		};
+
+		const bareToken = async (header: string): Promise<number> => {
+			const token = await lock('/a.txt');
+			const res = await request('/a.txt', {
+				method: 'PUT',
+				headers: { If: header.replace('%', token.slice(1, -1)) },
+				body: 'x',
+			});
+			await request('/a.txt', { method: 'UNLOCK', headers: { 'Lock-Token': token } });
+			return res.status;
+		};
+
+		it('accepts a bare paren-free lock token tag (Tag-list)', async () => {
+			// If: <opaquelocktoken:…> with no wrapping parens — previously 400.
+			expect(await bareToken('<%>')).toBe(204);
+		});
+
+		it('bare foreign lock token on a locked resource is 423, not 400', async () => {
+			const token = await lock('/a.txt');
+			const res = await request('/a.txt', {
+				method: 'PUT',
+				headers: { If: '<opaquelocktoken:00000000-0000-4000-8000-000000000000:1>' },
+				body: 'forged',
+			});
+			expect(res.status).toBe(423);
+			await request('/a.txt', { method: 'UNLOCK', headers: { 'Lock-Token': token } });
+		});
+
+		it('accepts a bare bracketed etag (No-tag-list)', async () => {
+			const md5 = tb.find('/a.txt')!.md5;
+			const ok = await request('/a.txt', {
+				method: 'PUT',
+				headers: { If: `["${md5}"]` },
+				body: 'etag-gated write',
+			});
+			expect(ok.status).toBe(204);
+			const stale = await request('/a.txt', {
+				method: 'PUT',
+				headers: { If: '["deadbeefdeadbeefdeadbeefdeadbeef"]' },
+				body: 'nope',
+			});
+			expect(stale.status).toBe(412);
+		});
+	});
+
+	describe('Terabox errno → HTTP status mapping', () => {
+		it('maps storage-capacity refusals (-10) to 507 Insufficient Storage', async () => {
+			tb.precreateErrno = -10;
+			const res = await request('/full.txt', { method: 'PUT', body: 'x' });
+			expect(res.status).toBe(507);
+		});
+
+		it('maps -32 and 58 (plan limits) to 507 as well', async () => {
+			tb.precreateErrno = -32;
+			expect((await request('/full2.txt', { method: 'PUT', body: 'x' })).status).toBe(507);
+			tb.precreateErrno = 58;
+			expect((await request('/full3.txt', { method: 'PUT', body: 'x' })).status).toBe(507);
+		});
+
+		it('maps a rejected file name (-7) to 403', async () => {
+			tb.precreateErrno = -7;
+			const res = await request('/badname.txt', { method: 'PUT', body: 'x' });
+			expect(res.status).toBe(403);
+		});
+
+		it('maps an upstream HTTP failure (-5) to 502', async () => {
+			// Every candidate upload host rejects → the failover exhausts and
+			// the TeraboxError surfaces as a gateway problem.
+			tb.locateServers = ['only-bad.example'];
+			tb.rejectHosts.add('only-bad.example');
+			const res = await request('/nowhere.txt', { method: 'PUT', body: 'x' });
+			expect(res.status).toBe(502);
+		});
+	});
+
+	describe('LOCK request validation and owner storage', () => {
+		it('rejects a non-well-formed LOCK body with 400', async () => {
+			const res = await request('/a.txt', {
+				method: 'LOCK',
+				headers: { 'Content-Type': 'application/xml' },
+				body: '<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/>',
+			});
+			expect(res.status).toBe(400);
+		});
+
+		it('stores owner markup self-contained (prefixes hoisted from the request)', async () => {
+			// The client declares X: only on the lockinfo root; the owner
+			// fragment must not re-emerge namespace-dead in lockdiscovery.
+			const lockRes = await request('/a.txt', {
+				method: 'LOCK',
+				headers: { 'Content-Type': 'application/xml' },
+				body:
+					'<D:lockinfo xmlns:D="DAV:" xmlns:X="urn:x-owner"><D:lockscope><D:exclusive/></D:lockscope>' +
+					'<D:locktype><D:write/></D:locktype><D:owner><X:name>Ann</X:name></D:owner></D:lockinfo>',
+			});
+			expect(lockRes.status).toBe(200);
+			const token = lockRes.headers.get('Lock-Token')!;
+			const propfind = await request('/a.txt', {
+				method: 'PROPFIND',
+				headers: { Depth: '0', 'Content-Type': 'application/xml' },
+				body: '<D:propfind xmlns:D="DAV:"><D:prop><D:lockdiscovery/></D:prop></D:propfind>',
+			});
+			const body = await propfind.text();
+			expect(body).toContain('<X:name xmlns:X="urn:x-owner">Ann</X:name>');
+			await request('/a.txt', { method: 'UNLOCK', headers: { 'Lock-Token': token } });
+		});
+	});
+
+	describe('MOVE/COPY collection containment (RFC 4918 §9.9.3/§9.9.4)', () => {
+		it('MOVE of a collection into its own descendant is 409', async () => {
+			await request('/cycle', { method: 'MKCOL' });
+			await request('/cycle/sub', { method: 'MKCOL' });
+			const res = await request('/cycle', {
+				method: 'MOVE',
+				headers: { Destination: ORIGIN + '/cycle/sub/moved' },
+			});
+			expect(res.status).toBe(409);
+			expect(tb.find('/cycle/sub/moved')).toBeUndefined();
+		});
+
+		it('COPY of a collection into its own descendant is 409', async () => {
+			await request('/tree', { method: 'MKCOL' });
+			await request('/tree/sub', { method: 'MKCOL' });
+			const res = await request('/tree', {
+				method: 'COPY',
+				headers: { Destination: ORIGIN + '/tree/sub/copied' },
+			});
+			expect(res.status).toBe(409);
+			expect(tb.find('/tree/sub/copied')).toBeUndefined();
+		});
+	});
+
+	describe('PUT stat-error propagation', () => {
+		it('a failed target stat is a 502, never a silent create/overwrite', async () => {
+			// Only the TARGET stat fails (-5); its parent stays healthy, so
+			// the request reaches handlePut's stat and must surface the error
+			// instead of reinterpreting it as "absent → 201".
+			tb.filemetasFailPaths.set('/a.txt', -5);
+			const res = await request('/a.txt', { method: 'PUT', body: 'must not land' });
+			expect(res.status).toBe(502);
+			// The stored bytes are untouched — no silent overwrite happened.
+			expect(new TextDecoder().decode(tb.find('/a.txt')!.content!)).toBe('the quick brown fox\n');
+		});
+
+		it('a genuinely absent target (-9) still creates with 201', async () => {
+			const res = await request('/brand-new.txt', { method: 'PUT', body: 'created' });
+			expect(res.status).toBe(201);
+		});
+	});
+
+	describe('directory listing truncation guard', () => {
+		it('a listing that would truncate fails loudly instead of lying', async () => {
+			// The API caps a listing at 100 pages × 100 entries; silently
+			// stopping would make sync clients treat the missing tail as
+			// deletions on the next run.
+			tb.listFullPages = true;
+			const res = await request('/docs', { method: 'PROPFIND', headers: { Depth: '1' } });
+			expect(res.status).toBe(502);
+			const body = (await res.json()) as { error?: string };
+			expect(body.error).toContain('truncated');
+		});
+	});
+
+	describe('mtime fallback (server_mtime absent)', () => {
+		it('falls back to the client-visible mtime for Last-Modified and etag', async () => {
+			// Real list entries sometimes carry ctime/mtime INSTEAD of
+			// server_mtime; epoch-0 Last-Modified breaks conditional requests.
+			const node = tb.seed('/no-server-mtime.bin', { content: '0123456789', md5: '' });
+			node.server_mtime = 0;
+			node.mtime = 1704067200;
+			const res = await request('/no-server-mtime.bin');
+			expect(res.status).toBe(200);
+			expect(res.headers.get('Last-Modified')).toBe(new Date(1704067200 * 1000).toUTCString());
+			expect(res.headers.get('ETag')).toBe('"1704067200-10-0"');
+		});
+
+		it('falls back to ctime when mtime is missing too', async () => {
+			const node = tb.seed('/no-mtime.bin', { content: 'abc', md5: '' });
+			node.server_mtime = 0;
+			node.ctime = 1700000000;
+			const res = await request('/no-mtime.bin');
+			expect(res.headers.get('Last-Modified')).toBe(new Date(1700000000 * 1000).toUTCString());
+		});
+	});
+
+	describe('multi-chunk upload (subarray views, no body copies)', () => {
+		it('PUTs a >4 MiB file as multiple chunks and round-trips intact', async () => {
+			// Free-tier chunk size is 4 MiB; 5 MiB exercises two superfile2
+			// uploads. The rewrite passes subarray VIEWS to md5/Blob instead
+			// of slice() copies — behavior must be byte-identical.
+			const size = 5 * 1024 * 1024 + 12345;
+			const bytes = new Uint8Array(size);
+			for (let i = 0; i < size; i += 1) bytes[i] = i & 0xff;
+			const res = await request('/big.bin', { method: 'PUT', body: bytes });
+			expect(res.status).toBe(201);
+			expect(tb.superfile2Calls).toBe(2);
+			const stored = tb.find('/big.bin')!;
+			expect(stored.size).toBe(size);
+			// Spot-check the reassembled bytes at chunk boundaries (3 MiB and
+			// the 4 MiB seam where the second chunk starts) plus the tail —
+			// full toEqual on 5 MiB is needlessly slow.
+			expect(stored.content![3 * 1024 * 1024]).toBe((3 * 1024 * 1024) & 0xff);
+			expect(stored.content![4 * 1024 * 1024]).toBe(0);
+			expect(stored.content![size - 1]).toBe((size - 1) & 0xff);
+			// GET serves the same validators as the upload produced.
+			const get = await request('/big.bin');
+			expect(get.status).toBe(200);
+			expect(get.headers.get('ETag')).toBe(`"${stored.md5}"`);
+		});
+
+		it('an empty PUT still finalizes as a single zero-byte chunk', async () => {
+			const res = await request('/empty2.bin', { method: 'PUT', body: new Uint8Array(0) });
+			expect(res.status).toBe(201);
+			expect(tb.find('/empty2.bin')!.size).toBe(0);
+		});
+	});
+
+	describe('XML bare-& rejection', () => {
+		it('PROPFIND with a bare & in element text is 400', async () => {
+			const res = await request('/a.txt', {
+				method: 'PROPFIND',
+				headers: { Depth: '0', 'Content-Type': 'application/xml' },
+				body: '<D:propfind xmlns:D="DAV:"><D:prop><D:displayname>Tom & Jerry</D:displayname></D:prop></D:propfind>',
+			});
+			expect(res.status).toBe(400);
+		});
+
+		it('PROPFIND with a well-formed &amp; entity is accepted', async () => {
+			const res = await request('/a.txt', {
+				method: 'PROPFIND',
+				headers: { Depth: '0', 'Content-Type': 'application/xml' },
+				body: '<D:propfind xmlns:D="DAV:"><D:prop><D:displayname>Tom &amp; Jerry</D:displayname></D:prop></D:propfind>',
+			});
+			expect(res.status).toBe(207);
+		});
+
+		it('LOCK with a bare & in the owner is 400', async () => {
+			const res = await request('/a.txt', {
+				method: 'LOCK',
+				headers: { 'Content-Type': 'application/xml' },
+				body:
+					'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+					'<D:locktype><D:write/></D:locktype><D:owner>R&D</D:owner></D:lockinfo>',
+			});
+			expect(res.status).toBe(400);
+		});
 	});
 });

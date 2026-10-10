@@ -24,6 +24,20 @@ export function resetDavVolatileState(): void {
   resetDavStoreState();
   metaCache.clear();
 }
+
+/** Test hook: current metaCache occupancy (cap assertions in dav.test.ts). */
+export function metaCacheSize(): number {
+  return metaCache.size;
+}
+/** Test hook: seed the cache through the same write path itemInfoCached
+ *  uses (expiry sweep + FIFO cap), without an HTTP round-trip per entry. */
+export function metaCacheSeedForTest(absPath: string, item: TeraboxItem): void {
+  cacheWrite(absPath, item);
+}
+/** Test hook: is a path currently cached? */
+export function metaCacheHasForTest(absPath: string): boolean {
+  return metaCache.has(absPath);
+}
 export type { LockRecord };
 
 export const DAV_NS = 'DAV:';
@@ -257,11 +271,9 @@ const META_TTL_MS = 60_000;
 const META_MAX_ENTRIES = 2000;
 const metaCache = new Map<string, { item: TeraboxItem; expires: number }>();
 
-async function itemInfoCached(client: TeraboxClient, absPath: string): Promise<TeraboxItem> {
-  const hit = metaCache.get(absPath);
-  if (hit && hit.expires > Date.now()) return hit.item;
-  const item = await client.itemInfo(absPath, true);
-  // Evict expired entries on write, then enforce the size cap FIFO.
+/** Insert into the meta cache: sweep expired entries, then enforce the size
+ *  cap FIFO before writing. Shared by the live stat path and test seeding. */
+function cacheWrite(absPath: string, item: TeraboxItem): void {
   const now = Date.now();
   for (const [key, entry] of metaCache) {
     if (entry.expires <= now) metaCache.delete(key);
@@ -272,6 +284,13 @@ async function itemInfoCached(client: TeraboxClient, absPath: string): Promise<T
     metaCache.delete(oldest.value);
   }
   metaCache.set(absPath, { item, expires: now + META_TTL_MS });
+}
+
+async function itemInfoCached(client: TeraboxClient, absPath: string): Promise<TeraboxItem> {
+  const hit = metaCache.get(absPath);
+  if (hit && hit.expires > Date.now()) return hit.item;
+  const item = await client.itemInfo(absPath, true);
+  cacheWrite(absPath, item);
   return item;
 }
 
