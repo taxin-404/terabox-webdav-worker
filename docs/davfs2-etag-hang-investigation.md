@@ -1,11 +1,13 @@
 # davfs2 large-file re-download investigation (open() "hangs forever")
 
-Status: **root cause identified; fix implemented on `fix/davfs2-etag-hang`
-(pending review — not yet on `main`/production).** Originally written
-2026-10-10 as a handoff for an independent diagnosis pass; the "Proposed fix"
-section below is now the implemented change. Everything was established from
-the davfs2 source (Debian sid tree) plus a live `strace -f` of the real daemon
-against the production worker.
+Status: **root cause pinned by deduction (not wire-observed); fix implemented
+on `fix/davfs2-etag-hang` (pending review — not yet on `main`/production).**
+Originally written 2026-10-10 as a handoff; a second pass re-verified every
+load-bearing davfs2 claim against the Debian master sources
+(`src/webdav.c`, `src/cache.c`) and tightened the deduction (see
+"Independent verification" below). Everything was established from the davfs2
+source plus a live `strace -f` of the real daemon against the production
+worker.
 
 ## TL;DR
 
@@ -168,6 +170,35 @@ Remaining single link: **the worker's response to the daemon's downloads #2
 passed through from the PCS upstream), leaving `node->etag` NULL. Not directly
 observed — the status was TLS-encrypted and `wrangler tail` was down.
 
+## Independent verification (second pass, 2026-10-10)
+
+Re-checked against Debian master `davfs2` sources rather than trusting this
+handoff's line citations:
+
+- `dav_get_file` (webdav.c:740): `If-None-Match` is added only under
+  `if (etag && *etag)` — a NULL etag is exactly the observed bare request.
+- The validator capture is strictly `if (!ret && status->code == 200)` and
+  does `*etag = normalize_etag(response ETag)` — so any **successful** GET
+  that is not a 200 (a 206, which `ne_accept_2xx` streams into the cache as
+  a success), or a 200 lacking an ETag header, **frees and NULLs** the
+  caller's stored etag.
+- The fresh-download branch (cache.c:2696-2706) passes a **local NULL** etag
+  and, on success, unconditionally assigns `node->etag = etag` — wiping the
+  PROPFIND-provided validator. The error branch (2718-2723) deletes the
+  partial cache and does **not** touch `node->etag`.
+
+That last detail tightens the deduction beyond the original "presumed": a
+*failed* download leaves `node->etag` intact, so the daemon's bare GET at
+13:50 (its stored etag had to be NULL for `If-None-Match` to be absent) can
+only be explained by a **successful** response that skipped the capture block
+— a `206` (the md5-less-`200` alternative was already ruled out by the 6/6
+md5 samples). Still an inference, not a wire capture: the 206 itself was
+never observed. The fix removes the mechanism regardless of which flap
+occurred, and no worker GET response shape can trigger the wipe path once it
+is in: post-fix the only GET statuses emitted are `200` (always with ETag),
+`206` (only when requested), `304` (leaves `node->etag` untouched) and
+errors.
+
 ## How to close the last link
 
 1. **Cheap flap hunt** (no mount needed): poll the video's no-Range GET status,
@@ -230,6 +261,12 @@ observed — the status was TLS-encrypted and `wrangler tail` was down.
    ```
 
    Result on the branch: typecheck clean, 142/142 tests, dry-run bundles.
+   Pre-fix differential: reverting `src/webdav.ts` to `a36c847` fails **4 of
+   the 6** new tests (the unrequested-206 normalization, the truncated-206
+   ladder fall-through, the all-truncated 502, the md5-less etag fallback);
+   the remaining 2 are regression guards for behaviour that already worked
+   (the `If-None-Match` short-circuit ahead of the ladder, and
+   requested-range pass-through).
    (A 10-sample live flap hunt on 2026-10-10 answered `200` every time — the
    upstream flap is intermittent, so production verification still needs the
    mount check below after merge.)
