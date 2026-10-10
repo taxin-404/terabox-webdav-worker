@@ -87,10 +87,26 @@ service from Cloudflare.
 - Region binding: accounts are tied to a deployment (`dm.terabox.com` cluster
   table); wrong origin → `31045` or `Url-Domain-Prefix` (`-6`) redirect.
 
-## 6. What is *not* a TeraBox limit (worker-side)
+## 6. What is *not* a TeraBox limit (worker-side design)
 
-- **WebDAV locks**: advisory (class 2 advertised, no server-side state) — our
-  design, matches most cloud-WebDAV gateways.
+- **WebDAV locks & dead properties are per-isolate, in-memory state.** The
+  worker has no storage binding, so LOCK records and PROPPATCH-set dead props
+  live in the isolate that handled the request. Consequences, all deliberate:
+  - Locks are **real**: un-tokened writes to a locked resource answer `423`,
+    UNLOCK validates its token (`409`), `lockdiscovery` reports the active
+    lock, shared locks stack, refresh works through `Depth: Infinity`
+    ancestors, and `If` headers are evaluated (`412`/`423`).
+  - After isolate rotation the state is gone. Enforcement then *relaxes*
+    (an empty store allows the write), and a self-issued lock token stays
+    valid for the rest of its embedded expiry so warm clients (Windows,
+    litmus) are never bricked mid-session. Worst case a client re-locks.
+  - Dead props survive PROPFIND/PROPPATCH/MOVE/COPY/DELETE within the
+    isolate, are keyed by expanded `{namespace}local` name, and are cleared
+    on DELETE.
+- **PUT auto-creates missing parent collections** (Google Drive worker parity
+  for clients that PUT deep paths without MKCOL). RFC 4918 §9.7.2 says 409;
+  this is the one intentional litmus deviation (`basic/put_no_parent`).
+  MKCOL and MOVE/COPY destinations *do* enforce the RFC rule (409).
 - **Lazily re-minted dlinks / TTFB**: no isolate-global dlink cache yet; would
   be a worker optimization (cache signed URLs up to min(1 h, 8 h) expiry).
 - **No parallel-range bandwidth gain**: limited by the CDN path cap, not by the
