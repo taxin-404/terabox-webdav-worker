@@ -6,15 +6,15 @@
 # 00:00 UTC is the guaranteed reset, some windows recover mid-window —
 # probe once before declaring it dead, never retry-loop it).
 #
-#   BASE=https://davbox.crazy-gooner-mf.workers.dev/dav USER_CRED=user:pass \
+#   BASE=https://davbox.tes1ing.workers.dev/dav USER_CRED=user:pass \
 #     ./scripts/live-litmus.sh
 #
 # Suites must run against the litmus COLLECTION under the WebDAV root
 # (/dav/litmus/ — a root-level /litmus/ 404s; each suite MKCOLs its own
 # /dav/litmus/litmus/ work collection and needs the parent to exist).
 set -u
-B="${BASE:-https://davbox.crazy-gooner-mf.workers.dev/dav}"
-A="${USER_CRED:-test:911}"
+B="${BASE:-https://davbox.tes1ing.workers.dev/dav}"
+A="${USER_CRED:-test:test}"
 LITMUS_SRC="${LITMUS_SRC:-/tmp/opencode/litmus}"
 # Note `-` not `:-` for SUITES: an explicitly empty SUITES must reach the
 # empty-guard below and refuse (exit 2) instead of silently meaning

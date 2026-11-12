@@ -18,8 +18,9 @@ describe('worker without USERS/COOKIE bindings', () => {
 		expect(res.status).toBe(500);
 	});
 });
-import { parseCredentials } from '../src/index';
+import { cookieNames, parseCredentials } from '../src/index';
 import { sign, valuedCookie } from '../src/sign';
+import { sanitizeNext } from '../src/login';
 
 describe('parseCredentials fails closed on a malformed USERS mapping', () => {
 	it('accepts a well-formed comma-separated list', () => {
@@ -56,5 +57,29 @@ describe('round 9 pins: cookie normalization and signing', () => {
 	it('sign() returns an empty signature for an empty key', () => {
 		expect(sign('', 'payload')).toBe('');
 		expect(sign('key', 'payload')).not.toBe('');
+	});
+});
+
+describe('round 17 pins: cookie diagnostics never expose values', () => {
+	it('reduces a bare ndus token to its cookie name', () => {
+		expect(cookieNames('BdSzXnAbC123')).toEqual(['ndus']);
+		expect(cookieNames('BdSzXnAbC123==')).toEqual(['ndus']);
+	});
+
+	it('lists names only for a full cookie jar', () => {
+		expect(cookieNames('ndus=secret; lang=en; browserid=abc')).toEqual(['ndus', 'lang', 'browserid']);
+	});
+
+	it('handles an absent cookie', () => {
+		expect(cookieNames(undefined)).toEqual([]);
+	});
+});
+
+describe('round 17 pins: redirect targets', () => {
+	it('rejects control characters that browsers strip into a scheme-relative URL', () => {
+		expect(sanitizeNext('/\t/evil.com')).toBeNull();
+		expect(sanitizeNext('/\n/evil.com')).toBeNull();
+		expect(sanitizeNext('//evil.com')).toBeNull();
+		expect(sanitizeNext('/dav/')).toBe('/dav/');
 	});
 });

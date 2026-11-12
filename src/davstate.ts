@@ -264,6 +264,12 @@ export const MAX_PROP_PATHS = 8192;
  *  shared locks may stack on a single path. */
 export const MAX_LOCK_PATHS = 4096;
 export const MAX_LOCK_RECORDS_PER_PATH = 32;
+/** Lock owner markup is stored for the lock's lifetime and re-persisted with
+ *  the whole advisory map. The request body cap (4 MiB) alone would let 32
+ *  records overflow the DO's single-value limit and turn every later
+ *  lock/prop write into a deployment-wide 500. */
+export const MAX_LOCK_OWNER_BYTES = 8 * 1024;
+export const MAX_LOCK_BYTES_PER_PATH = 128 * 1024;
 /**
  * Cap on concurrently OPEN (non-finalized) upload sessions (see
  * DavLimitError → 507). Open sessions expire via the 24 h TTL, but an
@@ -461,12 +467,27 @@ function coreLockAcquire(
   if (atPath && atPath.length >= MAX_LOCK_RECORDS_PER_PATH) {
     throw new DavLimitError('lock record cap reached');
   }
+  // Byte caps: record count alone does not bound the persisted value (the
+  // owner fragment can be up to the XML body cap). Check BEFORE mutating.
+  if (req.owner.length > MAX_LOCK_OWNER_BYTES) {
+    throw new DavLimitError('lock owner size cap reached');
+  }
   // Re-acquire a presented still-valid token ONLY in volatile mode (memory
   // store, whose records can be lost to isolate rotation). The DO persists
   // records — "lost" never legitimately happens there — and adopting what a
   // client presents would let it CHOOSE its own capability (§6.5).
   const token =
     (volatile ? req.presented.find(isOurUnexpiredToken) : undefined) ?? makeLockToken(req.seconds);
+  const usedBytes = (atPath ?? []).reduce(
+    (n, r) => n + r.owner.length + (r.rootHref?.length ?? 0) + r.token.length,
+    0,
+  );
+  if (
+    usedBytes + req.owner.length + (req.rootHref?.length ?? 0) + token.length >
+    MAX_LOCK_BYTES_PER_PATH
+  ) {
+    throw new DavLimitError('lock record byte cap reached');
+  }
   const record: LockRecord = {
     token,
     scope: req.shared ? 'shared' : 'exclusive',
@@ -544,6 +565,37 @@ function coreDescribe(
   return out;
 }
 
+function propBytes(record: Record<string, string>): number {
+  return Object.values(record).reduce((n, v) => n + v.length, 0);
+}
+
+function propsTotal(props: Map<string, Record<string, string>>): number {
+  let total = 0;
+  for (const rec of props.values()) total += propBytes(rec);
+  return total;
+}
+
+/**
+ * Enforce the dead-property budget on a candidate map. `oldTotal` lets an
+ * already-oversized map shrink: a repair must never be refused just because
+ * the state it repairs is over the cap.
+ */
+function assertPropsBudget(
+  props: Map<string, Record<string, string>>,
+  oldTotal: number,
+): void {
+  if (props.size > MAX_PROP_PATHS) throw new DavLimitError('dead-property path cap');
+  let total = 0;
+  for (const rec of props.values()) {
+    const bytes = propBytes(rec);
+    if (bytes > MAX_PROP_BYTES_PER_PATH) throw new DavLimitError('dead-property size cap per path');
+    total += bytes;
+  }
+  if (total > MAX_PROP_BYTES_TOTAL && total > oldTotal) {
+    throw new DavLimitError('dead-property total size cap');
+  }
+}
+
 function corePatch(
   props: Map<string, Record<string, string>>,
   path: string,
@@ -559,18 +611,9 @@ function corePatch(
     // persists the whole map — unbounded growth would eventually exceed the
     // storage value limit and turn every mutation deployment-wide into a 500.
     // 507 (RFC 4918 §7.1) is the honest answer to "cannot store".
-    const bytes = Object.values(store).reduce((n, v) => n + v.length, 0);
-    if (bytes > MAX_PROP_BYTES_PER_PATH) throw new DavLimitError('dead-property size cap per path');
-    if (bytes > MAX_PROP_BYTES_TOTAL) throw new DavLimitError('dead-property total size cap');
-    if (!props.has(path) && props.size >= MAX_PROP_PATHS) {
-      throw new DavLimitError('dead-property path cap');
-    }
-    let total = bytes;
-    for (const [key, rec] of props) {
-      if (key === path) continue;
-      total += Object.values(rec).reduce((n, v) => n + v.length, 0);
-      if (total > MAX_PROP_BYTES_TOTAL) throw new DavLimitError('dead-property total size cap');
-    }
+    const next = new Map(props);
+    next.set(path, store);
+    assertPropsBudget(next, propsTotal(props));
     props.set(path, store);
   } else props.delete(path);
   return store;
@@ -612,7 +655,15 @@ function coreRelocate(
     forgetCore(locks, item.src, item.recursive);
     return;
   }
-  rekeyCore(props, item.src, item.dest!, item.mode, item.recursive);
+  // Relocation used to bypass the dead-property caps: a recursive COPY of a
+  // large tree could grow the map past every limit, after which even a pure
+  // removal answered 507. Validate the projected map before committing.
+  const oldTotal = propsTotal(props);
+  const nextProps = new Map(props);
+  rekeyCore(nextProps, item.src, item.dest!, item.mode, item.recursive);
+  assertPropsBudget(nextProps, oldTotal);
+  props.clear();
+  for (const [key, value] of nextProps) props.set(key, value);
   if (item.mode === 'move' && item.withLocks) {
     rekeyCore(locks, item.src, item.dest!, 'move', item.recursive);
   }

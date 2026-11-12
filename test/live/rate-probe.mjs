@@ -10,7 +10,7 @@
 //   node test/live/rate-probe.mjs
 //
 // Results from the last campaign: see docs/live-testing.md.
-const BASE = (process.env.WEBDAV_URL || 'https://davbox.crazy-gooner-mf.workers.dev') + '/';
+const BASE = (process.env.WEBDAV_URL || 'https://davbox.tes1ing.workers.dev') + '/';
 const USER = process.env.WEBDAV_USER;
 const PASS = process.env.WEBDAV_PASS;
 if (!USER || !PASS) {

@@ -2,7 +2,9 @@ import { env, SELF, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	createDavStore,
+	DavLimitError,
 	DO_NAME,
+	MAX_LOCK_OWNER_BYTES,
 	MAX_LOCK_PATHS,
 	MemoryDavStore,
 	UPLOAD_FINALIZED_GRACE_MS,
@@ -510,5 +512,38 @@ describe('account-wide API pacing (pace → DavState /api-slot)', () => {
 		const res = await request(srcPath);
 		expect(res.status).toBe(200);
 		expect(stats!.count).toBeGreaterThan(0);
+	});
+});
+
+describe('round 17 pins: advisory-state byte caps', () => {
+	it('refuses a lock owner above the byte cap before storing it', async () => {
+		const store = new MemoryDavStore();
+		await expect(
+			store.lockAcquire('/owner-cap.txt', {
+				shared: false,
+				depth: '0',
+				owner: 'x'.repeat(MAX_LOCK_OWNER_BYTES + 1),
+				presented: [],
+				seconds: 3600,
+			}),
+		).rejects.toBeInstanceOf(DavLimitError);
+		const state = await store.describe(['/owner-cap.txt']);
+		expect(state['/owner-cap.txt']!.locks).toHaveLength(0);
+	});
+
+	it('enforces the dead-property caps when a recursive COPY duplicates them', async () => {
+		const store = new MemoryDavStore();
+		const big = 'x'.repeat(30 * 1024);
+		for (let i = 0; i < 10; i += 1) {
+			await store.propPatch(`/src/f${i}`, [{ op: 'set', key: '{urn:x}p', markup: big }]);
+		}
+		await expect(
+			store.relocate([{ src: '/src', dest: '/dst', mode: 'copy', recursive: true }]),
+		).rejects.toBeInstanceOf(DavLimitError);
+		// The rejected relocation must leave the source intact and publish nothing.
+		const src = await store.describe(['/src/f0']);
+		expect(src['/src/f0']!.props['{urn:x}p']).toBe(big);
+		const dst = await store.describe(['/dst/f0']);
+		expect(dst['/dst/f0']!.props).toEqual({});
 	});
 });

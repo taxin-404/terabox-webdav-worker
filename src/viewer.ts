@@ -9,10 +9,11 @@
  * discriminator.
  *
  * Security posture:
- *   - Basic auth or the signed session cookie (both fail-closed upstream
+ *   - Basic auth or a per-tab signed session (both fail-closed upstream
  *     in the fetch handler — nothing here re-implements auth). Browsers
- *     sign in through /.dav-login; the HttpOnly cookie then rides every
- *     XHR/PUT automatically, so closing the tab never orphans a transfer.
+ *     sign in through /.dav-login; the credential lives in sessionStorage
+ *     (never a cookie) and every XHR/PUT carries it explicitly, so closing
+ *     the tab ends the session.
  *   - The page carries its own CSP: inline script/style for itself,
  *     `connect-src 'self'` for same-origin XHR, `form-action 'self'` for
  *     the sign-out form, `frame-ancestors 'none'`. No img/media-src: the

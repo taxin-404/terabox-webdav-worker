@@ -754,6 +754,10 @@ export class TeraboxClient {
 
   async downloadLink(fileId: string): Promise<string> {
     const home = await this.homeInfo();
+    // 64-bit fs_ids above 2^53 lose precision as JS numbers and mint a
+    // different file's link; keep those verbatim and only narrow safe ids.
+    const numeric = Number(fileId);
+    const fid = Number.isSafeInteger(numeric) ? numeric : fileId;
     const { json } = await this.request<{ errno?: number; dlink?: Array<{ fs_id: string; dlink?: string }> }>(
       '/api/download',
       {
@@ -763,7 +767,7 @@ export class TeraboxClient {
           sign: sign(home.sign3, home.sign1),
           timestamp: String(Math.floor(Date.now() / 1000)),
           need_speed: '1',
-          fidlist: JSON.stringify([Number(fileId)]),
+          fidlist: JSON.stringify([fid]),
         },
       },
     );
@@ -1055,6 +1059,14 @@ export class TeraboxClient {
       raw: true,
     });
 
+    // Validate per-entry errors BEFORE accepting a task id: adaptive mode can
+    // return taskid AND info[] together, and a failed copy/move/delete must
+    // never be reported as success just because the task id is non-zero.
+    const infos = json.info || [];
+    for (const entry of infos) {
+      if (entry.errno !== undefined && entry.errno !== 0) throw es(entry.errno);
+    }
+
     if (json.taskid && json.taskid > 0) {
       // Adaptive mode may still report a task id for slow operations; the
       // result is observable on the next list (bclone reads info and moves
@@ -1062,10 +1074,6 @@ export class TeraboxClient {
       return;
     }
 
-    const infos = json.info || [];
-    for (const entry of infos) {
-      if (entry.errno !== undefined && entry.errno !== 0) throw es(entry.errno);
-    }
     if (infos.length === 0 && json.errno) throw es(json.errno);
   }
 

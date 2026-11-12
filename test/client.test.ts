@@ -349,3 +349,30 @@ describe('resolved fetches: credential boundary + header bound (reviews R14/R15)
 		}
 	});
 });
+
+describe('round 17 pins: upstream JSON and 64-bit ids', () => {
+	it('inspects info[].errno even when filemanager returns a taskid', async () => {
+		const { MockTerabox, installMock } = await import('./helpers');
+		const tb = new MockTerabox();
+		tb.seed('/src.txt', { content: 'x' });
+		tb.seed('/dst.txt', { content: 'y' });
+		tb.filemanagerTaskid = 7;
+		tb.filemanagerReportedErrno = -9;
+		installMock(tb);
+		const client = new TeraboxClient('ndus=x', 'https://mock.terabox.example', { minGapMs: 0 });
+		await expect(
+			client.fileOperation('move', [{ path: '/src.txt', dest: '/dst.txt' }]),
+		).rejects.toMatchObject({ errno: -9 });
+	});
+
+	it('keeps a 64-bit fs_id outside the safe-integer range verbatim', async () => {
+		const { MockTerabox, installMock } = await import('./helpers');
+		const tb = new MockTerabox();
+		tb.seed('/big.bin', { content: 'x', fs_id: '9007199254740993' });
+		installMock(tb);
+		const client = new TeraboxClient('ndus=x', 'https://mock.terabox.example', { minGapMs: 0 });
+		const url = await client.downloadLink('9007199254740993');
+		expect(url).toContain('via=official');
+		expect(tb.downloadFidlists.at(-1)).toEqual(['9007199254740993']);
+	});
+});

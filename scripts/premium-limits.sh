@@ -12,8 +12,8 @@
 #   BASE=https://davbox.tes1ing.workers.dev/dav USER_CRED=test:test \
 #     bash scripts/premium-limits.sh
 set -u
-BASE="${BASE:-https://davbox.crazy-gooner-mf.workers.dev/dav}"
-A="${USER_CRED:-test:911}"
+BASE="${BASE:-https://davbox.tes1ing.workers.dev/dav}"
+A="${USER_CRED:-test:test}"
 B="$BASE/.resumable"
 STAMP=$(date +%s)
 PASS=0; FAIL=0

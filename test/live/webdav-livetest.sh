@@ -10,7 +10,7 @@
 # (/wtest-<epoch>) that is deleted at the end. No credentials are stored here.
 set -u
 
-URL="${WEBDAV_URL:-https://davbox.crazy-gooner-mf.workers.dev}"
+URL="${WEBDAV_URL:-https://davbox.tes1ing.workers.dev}"
 USER="${WEBDAV_USER:?set WEBDAV_USER}"
 PASS="${WEBDAV_PASS:?set WEBDAV_PASS}"
 AUTH="$USER:$PASS"

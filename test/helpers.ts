@@ -81,6 +81,13 @@ export class MockTerabox {
 	/** Last rtype the worker sent to /api/create — pins which conflict policy
 	 *  (0 create-only / 1 rename / 3 overwrite) the SERVER chose. */
 	lastRtype: number | null = null;
+	/** Force /api/filemanager to return this task id (adaptive-mode shape). */
+	filemanagerTaskid = 0;
+	/** Force every filemanager info[] entry to this errno — proves the worker
+	 *  inspects info[] even when a task id is present. */
+	filemanagerReportedErrno = 0;
+	/** fidlist values observed at /api/download (64-bit id precision pin). */
+	downloadFidlists: unknown[] = [];
 	/** Per-path /api/filemetas failures — lets a test make ONE stat fail
 	 *  (e.g. the PUT target) while its parent stays healthy. */
 	filemetasFailPaths = new Map<string, number>();
@@ -125,9 +132,10 @@ export class MockTerabox {
 
 	seed(path: string, opts: { content?: string | Uint8Array } & Omit<Partial<MockNode>, 'content'> = {}): MockNode {
 		const content = typeof opts.content === 'string' ? TEXT(opts.content) : opts.content;
-		// Real Terabox fs_ids are numeric — downloadLink() sends them as
-		// unquoted numbers in fidlist, so string ids ("fs-2") would never match.
-		const fsId = String(1000000 + this.nodes.size);
+		// Real Terabox fs_ids are numeric — downloadLink() sends safe ids as
+		// unquoted numbers in fidlist, so string ids ("fs-2") would never
+		// match; `opts.fs_id` allows a 64-bit id that must stay a string.
+		const fsId = opts.fs_id ?? String(1000000 + this.nodes.size);
 		if (opts.isdir) {
 			const node: MockNode = {
 				path,
@@ -359,6 +367,7 @@ export class MockTerabox {
 			}
 			if (pathname === '/api/download') {
 				const fidlist = JSON.parse(url.searchParams.get('fidlist') || '[]') as number[];
+				this.downloadFidlists.push(fidlist);
 				const want = new Set(fidlist.map(String));
 				const nodes = [...this.nodes.values()].filter((n) => n.fs_id && want.has(n.fs_id));
 				return json({
@@ -475,7 +484,10 @@ export class MockTerabox {
 					}
 					info.push({ errno: 0 });
 				}
-				return json({ errno: 0, taskid: 0, info });
+				if (this.filemanagerReportedErrno) {
+					for (const entry of info) entry.errno = this.filemanagerReportedErrno;
+				}
+				return json({ errno: 0, taskid: this.filemanagerTaskid, info });
 			}
 			if (pathname === '/rest/2.0/membership/proxy/user') {
 				if (this.membershipErrno) return json({ errno: this.membershipErrno });

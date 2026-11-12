@@ -364,6 +364,10 @@ export function mountBasePath(base: string): string {
 
 /** XML request bodies are read from the wire at most this much (see below). */
 const MAX_XML_BODY = 4 * 1024 * 1024;
+/** Distinct properties one PROPFIND may name. The 4 MiB body cap alone still
+ *  allows ~500k elements, and every one is re-emitted per response entry —
+ *  a single authenticated request could build hundreds of MB of strings. */
+const MAX_PROPFIND_PROPS = 128;
 /** Hard cap for the JSON `POST /.resumable` begin body (path + size). */
 const RESUMABLE_BEGIN_MAX = 64 * 1024;
 /** PUT bodies above this (Content-Length known) stream through the multipart
@@ -904,8 +908,13 @@ async function checkHttpPreconditions(
     const dentry = await statResourceFresh(client, path);
     if (!dentry) return errorResponse('Precondition Failed', 412);
     if (ifMatch.trim() !== '*') {
+      // §2.3.2: If-Match uses strong comparison, so a weak validator can
+      // never satisfy it. GET/HEAD already enforce this; the write path must
+      // agree or a same-second rewrite passes a precondition it should fail.
       const tags = ifMatch.split(',').map((tag) => tag.trim());
-      if (!tags.includes(dentry.etag)) return errorResponse('Precondition Failed', 412);
+      if (dentry.etag.startsWith('W/') || !tags.includes(dentry.etag)) {
+        return errorResponse('Precondition Failed', 412);
+      }
     }
   } else {
     const ifUnmodified = request.headers.get('If-Unmodified-Since');
@@ -936,6 +945,25 @@ async function checkHttpPreconditions(
 }
 
 /**
+ * Tokens a client may present as a lock credential: non-negated, token-kind
+ * terms only. `(Not <T>)` asserts that T does NOT lock the resource — it is a
+ * condition, never a capability. Feeding it to enforcement would let `Not`
+ * polarity invert into a successful write-through.
+ */
+function presentedCredentials(ifHeader: string | null): string[] {
+  if (!ifHeader) return [];
+  const lists = parseIfHeader(ifHeader);
+  if (!lists) return [];
+  const out: string[] = [];
+  for (const list of lists) {
+    for (const term of list.terms) {
+      if (term.kind === 'token' && !term.negated) out.push(term.value);
+    }
+  }
+  return out;
+}
+
+/**
  * Precondition gate for every mutating method: unmet `If` (and the
  * mod_dav-style invalid-token upgrade) answers 412/423, then lock
  * enforcement applies. Each list is evaluated against the resource it
@@ -959,6 +987,7 @@ async function checkMutationPreconditions(
 
   const ifHeader = request.headers.get('If');
   const presented = collectTokens(ifHeader);
+  const credentials = presentedCredentials(ifHeader);
   let check: TokenCheck | null = null;
   if (ifHeader) {
     const lists = parseIfHeader(ifHeader);
@@ -1098,10 +1127,11 @@ async function checkMutationPreconditions(
     if (!anyTrue) return errorResponse('Precondition Failed', 412);
   }
   if (opts?.enforce === false) return null;
-  // RFC 4918 §6: writing a locked resource without its token is 423.
-  const effective = check ?? (await store.checkTokens(path, presented));
+  // RFC 4918 §6: writing a locked resource without its token is 423. Only
+  // non-negated terms are credentials — see presentedCredentials().
+  const effective = check ?? (await store.checkTokens(path, credentials));
   if (effective.applying === 0) return null;
-  if (effective.recordTokens.some((t) => presented.includes(t))) return null;
+  if (credentials.some((t) => effective.recordTokens.includes(t))) return null;
   return errorResponse('Locked', 423);
 }
 
@@ -1111,10 +1141,10 @@ async function enforceWrite(
   store: DavStore,
   path: string,
 ): Promise<Response | null> {
-  const presented = collectTokens(request.headers.get('If'));
-  const check = await store.checkTokens(path, presented);
+  const credentials = presentedCredentials(request.headers.get('If'));
+  const check = await store.checkTokens(path, credentials);
   if (check.applying === 0) return null;
-  if (check.recordTokens.some((t) => presented.includes(t))) return null;
+  if (credentials.some((t) => check.recordTokens.includes(t))) return null;
   return errorResponse('Locked', 423);
 }
 
@@ -1207,6 +1237,8 @@ export interface PropQuery {
   kind: 'all' | 'names' | 'list';
   /** Requested elements: expanded names plus self-contained markup. */
   requested: PropElement[];
+  /** The client named more distinct properties than the server will emit. */
+  tooMany?: boolean;
 }
 
 /**
@@ -1234,8 +1266,21 @@ export function parsePropfindBody(xml: string): PropQuery {
   const close = inner.match(new RegExp(`</${pfx}prop\\s*>`));
   if (!close || close.index === undefined) return all;
 
-  const requested = parsePropElements(inner.slice(0, close.index), collectXmlScope(body));
-  if (requested.length === 0) return all;
+  const parsed = parsePropElements(inner.slice(0, close.index), collectXmlScope(body));
+  if (parsed.length === 0) return all;
+  // Dedupe by expanded name, then bound the set. Every requested element is
+  // re-emitted once per response entry, so an unbounded (or heavily repeated)
+  // body turns one PROPFIND into an O(props × children) string build.
+  const seen = new Set<string>();
+  const requested: PropElement[] = [];
+  for (const el of parsed) {
+    if (seen.has(el.key)) continue;
+    seen.add(el.key);
+    requested.push(el);
+  }
+  if (requested.length > MAX_PROPFIND_PROPS) {
+    return { kind: 'list', requested: [], tooMany: true };
+  }
   return { kind: 'list', requested };
 }
 
@@ -1421,7 +1466,11 @@ export async function handleWebDav(
   // raw too (they read an existing resource); only their Destination is
   // rewritten, inside handleMoveCopy.
   const writeIntent = method === 'PUT' || method === 'MKCOL' || method === 'DELETE';
-  const absPath = mount.toTera(writeIntent ? upstreamSafeDavPath(davPath) : davPath);
+  // Writes are sanitized before they reach upstream, so the reserved-name
+  // check must run on the SANITIZED path too: `/.DAV☀` otherwise passes the
+  // raw check and creates a real `.DAV` collection upstream.
+  const upstreamDavPath = writeIntent ? upstreamSafeDavPath(davPath) : davPath;
+  const absPath = mount.toTera(upstreamDavPath);
 
   // Reserved metadata segment (litmus 0.18 `protected` suite; the
   // CVE-2026-42535 class in mod_dav_fs): a path whose segment is `.DAV`
@@ -1431,7 +1480,7 @@ export async function handleWebDav(
   // reserving the name keeps clients from planting a decoy directory that
   // a future metadata implementation — or a downstream server — would then
   // trust; every litmus protected status set admits 403 as the rejection.
-  if (method !== 'OPTIONS' && isReservedDavSegment(davPath)) {
+  if (method !== 'OPTIONS' && isReservedDavSegment(upstreamDavPath)) {
     return errorResponse('Forbidden', 403);
   }
 
@@ -1529,7 +1578,11 @@ async function handleResumable(
     // write, and upstream refuses emoji at creation (-7).
     let absPath: string;
     try {
-      absPath = mount.toTera(upstreamSafeDavPath(sanitizeDavPath(davPath)));
+      const safeDavPath = upstreamSafeDavPath(sanitizeDavPath(davPath));
+      // Same reservation as every other write: the sanitized name must not
+      // plant a `.DAV` segment (see the raw-path check in handleWebDav).
+      if (isReservedDavSegment(safeDavPath)) return errorResponse('Forbidden', 403);
+      absPath = mount.toTera(safeDavPath);
     } catch {
       return errorResponse('Invalid path encoding', 400);
     }
@@ -1799,6 +1852,9 @@ async function handlePropfind(
     if (xmlError) return errorResponse(`Invalid XML: ${xmlError}`, 400);
   }
   const query = parsePropfindBody(body);
+  if (query.tooMany) {
+    return errorResponse(`Too many properties (max ${MAX_PROPFIND_PROPS})`, 400);
+  }
   const resource = await statResource(client, absPath);
   if (!resource) return errorResponse('Not Found', 404);
 
@@ -2218,6 +2274,12 @@ async function handlePut(
   mount: Mount,
 ): Promise<Response> {
   if (mount.isRoot(absPath) || absPath === '') return errorResponse('Forbidden', 403);
+
+  // PUT replaces the whole entity. A ranged PUT fragment cannot be honored
+  // as an object body (RFC 9110 §14.4: reject rather than store it whole).
+  if (request.headers.get('Content-Range')) {
+    return errorResponse('Content-Range is not supported on PUT', 400);
+  }
 
   const pre = await checkMutationPreconditions(request, client, store, absPath, mount);
   if (pre) return pre;

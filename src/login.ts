@@ -134,6 +134,10 @@ export function sessionClearCookie(): string {
  */
 export function sanitizeNext(raw: string | null | undefined): string | null {
   if (!raw) return null;
+  if (raw.length > 2048) return null;
+  // Control characters (HTAB included) are legal in an HTTP field value but
+  // stripped by browsers' URL parser: `/\t/evil.com` becomes `//evil.com`.
+  if (/[\u0000-\u001f\u007f]/.test(raw)) return null;
   if (!raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\')) return null;
   return raw;
 }

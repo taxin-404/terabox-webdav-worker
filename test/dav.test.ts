@@ -924,14 +924,16 @@ describe('PUT and MKCOL parents', () => {
 		expect(new TextDecoder().decode(tb.find('/prem-probe.txt')!.content)).toBe('still works');
 	});
 
-	it('reports the failing upload stage and errno in the error body', async () => {
+	it('reports the failing upload stage and errno in the error body without leaking upstream text', async () => {
 		tb.precreateErrno = 4000023;
 		const res = await request('/stuck.txt', { method: 'PUT', body: 'x' });
 		expect(res.status).toBe(401);
 		const body = (await res.json()) as { error: string; errno?: number; step?: string; upstream?: string };
 		expect(body.errno).toBe(4000023);
 		expect(body.step).toBe('precreate');
-		expect(body.upstream).toBe('simulated verify required');
+		// Round 17: upstream snippets and cookie metadata are server-log only.
+		expect(body.upstream).toBeUndefined();
+		expect(body).not.toHaveProperty('cookieKeys');
 	});
 
 	it('fails over to the next candidate server when a cluster answers 403', async () => {
@@ -4063,5 +4065,102 @@ describe('PUT body paths: streaming above the threshold, capped buffer without C
 		expect(streamSpy).toHaveBeenCalled();
 		expect((await request('/truncated.bin')).status).toBe(404);
 		streamSpy.mockRestore();
+	});
+});
+
+describe('round 17 review pins', () => {
+	it('rejects a PROPFIND naming more distinct properties than the cap', async () => {
+		const props = Array.from({ length: 129 }, (_, i) => `<X:p${i}/>`).join('');
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: `<D:propfind xmlns:D="DAV:" xmlns:X="urn:x"><D:prop>${props}</D:prop></D:propfind>`,
+		});
+		expect(res.status).toBe(400);
+	});
+
+	it('dedupes repeated property names before the cap', async () => {
+		const props = '<D:displayname/>'.repeat(200);
+		const res = await request('/a.txt', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: `<D:propfind xmlns:D="DAV:"><D:prop>${props}</D:prop></D:propfind>`,
+		});
+		expect(res.status).toBe(207);
+		const body = await res.text();
+		expect(body.split('<D:displayname>').length - 1).toBe(1);
+	});
+
+	it('does not treat a negated live token as a write credential', async () => {
+		const lockRes = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body:
+				'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+				'<D:locktype><D:write/></D:locktype><D:owner><D:href>tester</D:href></D:owner></D:lockinfo>',
+		});
+		expect(lockRes.status).toBe(200);
+		const token = lockRes.headers.get('Lock-Token')!;
+		// The second (trivially true) list used to make the header pass; the
+		// negated live token then satisfied enforcement because collectTokens
+		// keeps `Not` terms. Only a positive term is a capability.
+		const res = await request('/a.txt', {
+			method: 'PUT',
+			headers: { If: `(Not ${token}) (Not <urn:uuid:deadbeef>)` },
+			body: 'bypass',
+		});
+		expect(res.status).toBe(423);
+		expect(new TextDecoder().decode(tb.find('/a.txt')!.content)).toBe('the quick brown fox\n');
+	});
+
+	it('rejects a weak If-Match validator on PUT (strong comparison)', async () => {
+		tb.seed('/weak-etag.txt', { content: 'weak', md5: '' });
+		const head = await request('/weak-etag.txt');
+		const etag = head.headers.get('ETag')!;
+		expect(etag.startsWith('W/')).toBe(true);
+		const res = await request('/weak-etag.txt', {
+			method: 'PUT',
+			headers: { 'If-Match': etag },
+			body: 'replacement',
+		});
+		expect(res.status).toBe(412);
+		expect(new TextDecoder().decode(tb.find('/weak-etag.txt')!.content)).toBe('weak');
+	});
+
+	it('rejects PUT with Content-Range instead of storing the fragment whole', async () => {
+		const res = await request('/ranged.txt', {
+			method: 'PUT',
+			headers: { 'Content-Range': 'bytes 0-3/10' },
+			body: 'abcd',
+		});
+		expect(res.status).toBe(400);
+		expect(tb.find('/ranged.txt')).toBeUndefined();
+	});
+
+	it('reserves .DAV even when sanitization would create it', async () => {
+		const res = await request('/.DAV%E2%98%80', { method: 'MKCOL' });
+		expect(res.status).toBe(403);
+		expect(tb.find('/.DAV')).toBeUndefined();
+	});
+
+	it('reserves .DAV in the resumable begin path too', async () => {
+		const res = await request('/.resumable', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: '/.DAV☀/x.bin', size: 1 }),
+		});
+		expect(res.status).toBe(403);
+	});
+
+	it('refuses a LOCK owner above the storage cap', async () => {
+		const owner = 'x'.repeat(9 * 1024);
+		const res = await request('/a.txt', {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body:
+				'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+				`<D:locktype><D:write/></D:locktype><D:owner>${owner}</D:owner></D:lockinfo>`,
+		});
+		expect(res.status).toBe(507);
 	});
 });

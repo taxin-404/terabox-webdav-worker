@@ -477,7 +477,7 @@ per-request, but not shared across isolates. The Worker keeps serving.
 ```sh
 npm install --legacy-peer-deps   # wrangler pins + sharp override
 npm run typecheck                # tsc --noEmit
-npm test                         # Vitest: 420 cases over a mocked TeraBox API
+npm test                         # Vitest: 428 cases over a mocked TeraBox API
 npm run review                   # typecheck + tests + dry-run deploy (no upload)
 npm run dev                      # local wrangler dev server (http://localhost:8787)
 npm run deploy                   # wrangler deploy (push to production)

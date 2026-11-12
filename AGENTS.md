@@ -49,7 +49,7 @@
 ## Environment
 
 - Node is not on the default PATH: `export PATH="$HOME/.local/node/bin:$PATH"`
-- Live worker: `https://davbox.crazy-gooner-mf.workers.dev/`, base `/dav/`.
+- Live worker: `https://davbox.tes1ing.workers.dev/`, base `/dav/`.
 - Tests: `npx vitest run` (projects: dav, mount, mount-utf8, auth, davstate).
   The `davstate` project binds the `DAV_STATE` Durable Object; `mount*`
   projects set `PATH` bindings.

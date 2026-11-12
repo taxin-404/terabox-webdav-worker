@@ -5,10 +5,11 @@ after every campaign so future sessions (human or AI) start with context.
 
 ## Target
 
-- Worker: `https://davbox.crazy-gooner-mf.workers.dev/` (deploys are **manual**
+- Worker: `https://davbox.tes1ing.workers.dev/` (deploys are **manual**
   `wrangler deploy` — the dashboard Git integration exists but is not enabled)
-- Credentials: WebDAV basic-auth test pair **`test:911`** (rotated from
-  `taxin:404` on 2026-10-12) ships as a default in
+- Credentials: WebDAV basic-auth test pair **`test:test`** on the `tes1ing`
+  deployment (the retired `crazy-gooner-mf` free domain still answers with
+  `test:911`; see "Deploy target" below). The pair ships as a default in
   `scripts/live-smoke.sh` / `scripts/live-litmus.sh`. Test-only — it is
   stored in the `USERS` secret, never changes again, and gets deleted
   together with the project when all work is done;
@@ -134,7 +135,9 @@ for dashboard deploy, retested):
   now in code: optional `JSTOKEN` secret (paste `window.jsToken`, Alist/CLI
   style), 5-min isolate cache, `/main?category=all` fallback, anonymous
   probe on failure reported via `upstream` (`/login=token anon:/login=token`).
-- `cookieKeys` in error bodies = cookie **names only** (never values).
+- `cookieKeys` (server log only, after the round-17 review) = cookie **names
+  only**; error bodies carry `errno`/`step` and never upstream text or cookie
+  metadata.
 
 ### Rate pacing shipped (`8f98c39`)
 
@@ -606,7 +609,10 @@ Deferred (user decisions): taskid `async=1` confirmation (deliberate bclone
 parity), uploadId nonce (would break the `tbbig` client).
 ~~account password rotation~~ **done 2026-10-12**: rotated to `test:911`
 (test-only pair in the `USERS` secret; deleted together with the project
-when all work is done — no further rotation planned).
+when all work is done — no further rotation planned). **2026-11-12:** the
+`tes1ing` deployment carries `test:test`; `test:911` now only answers on the
+retired `crazy-gooner-mf` domain, so any probe pointed there validates the
+wrong worker.
 ~~DO-backed cross-isolate pacing~~ shipped
 2026-10-11 (the DAV_STATE DO `/api-slot` route serializes the reservation
 account-wide; the isolate floor is the backstop).

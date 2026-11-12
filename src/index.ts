@@ -62,6 +62,23 @@ export function parseCredentials(users: string | undefined): Credential[] | null
   return creds;
 }
 
+/** Cookie NAMES only (never values) for diagnostics. A bare ndus value
+ *  (optionally base64-padded) is a value, not a name — it never reaches the
+ *  log as one. */
+export function cookieNames(cookie: string | undefined): string[] {
+  const raw = (cookie || '').trim();
+  if (!raw) return [];
+  if (/^[^;=\s]+=*$/.test(raw)) return ['ndus'];
+  const names = raw
+    .split(';')
+    .map((part) => {
+      const eq = part.indexOf('=');
+      return eq > 0 ? part.slice(0, eq).trim() : '';
+    })
+    .filter(Boolean);
+  return [...new Set(names)];
+}
+
 function validBasicAuth(request: Request, env: Env): boolean {
   const header = request.headers.get('Authorization') || '';
   // RFC 7235 §2.1: the auth-scheme is case-insensitive ("basic", "BASIC").
@@ -260,17 +277,17 @@ const worker: ExportedHandler<Env> = {
       return withSecurityHeaders(response);
     } catch (error) {
       if (error instanceof TeraboxError) {
-        log('error', `terabox errno ${error.errno}: ${error.message}`, { path: url.pathname, step: error.step });
-        // Additive diagnostics: which backend stage failed, with which errno,
-        // plus the cookie *names* in play (never values) to catch auth gaps.
+        // Diagnostics stay server-side: upstream body snippets (WAF pages,
+        // request ids) and cookie metadata must never reach the client.
+        log('error', `terabox errno ${error.errno}: ${error.message}`, {
+          path: url.pathname,
+          step: error.step,
+          ...(error.upstream ? { upstream: error.upstream } : {}),
+          cookieKeys: cookieNames(env.COOKIE),
+        });
         const detail = {
           errno: error.errno,
           ...(error.step ? { step: error.step } : {}),
-          ...(error.upstream ? { upstream: error.upstream } : {}),
-          cookieKeys: String(env.COOKIE)
-            .split(';')
-            .map((part) => part.split('=')[0]?.trim())
-            .filter(Boolean),
         };
         if (errnoIn(error, AUTH_ERRNOS)) {
           // Same challenge as the initial 401: without it neon/litmus and
