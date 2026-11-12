@@ -898,6 +898,48 @@ saved cookie, ever.** Campaign 7's HttpOnly cookie (`davbox_session`,
   web viewer's chunked uploader or the TeraBox app; no WebDAV single-PUT
   client can exceed the cap on the free plan.
 
+## Campaign 10 — performance pass, runtime refresh, traces (2026-11-12)
+
+Started from a live baseline on `tes1ing` (64 KiB file, warm): `HEAD`
+3221/779/390 ms, repeat `GET` 525/123/2499 ms, ranged `GET` 184/115/116 ms,
+`PROPFIND Depth:0` 151/94/81 ms. HEAD being *more* expensive than a ranged
+GET was the signal: it walked the whole download ladder and cancelled the
+body.
+
+- **HEAD fast path** (`436589f`): after conditional/range validation, answer
+  from cached `itemInfo` — size/ETag/Last-Modified are already authoritative
+  — and never mint a dlink or open a CDN body. Ranged HEAD computes
+  `Content-Range` locally; 416 and precondition precedence stay on the old
+  path. Live after deploy: HEAD **275 ms cold, 14–21 ms warm**; ranged HEAD
+  10–25 ms; ranged GET unchanged (109–183 ms).
+- **Directory-listing cache** (`436589f`): `/api/list` pages 100 entries at
+  the 400 ms account-wide pace, so a 500-entry folder cost ≥2 s on *every*
+  Depth:1. Listings now cache 15 s (`LIST_MAX_ENTRIES` 32,
+  `LIST_MAX_ITEMS` 4000), dropped immediately by any write through the
+  worker (path, subtree, parent + shared generation bump), so local writes
+  stay instantly visible; external app/web changes appear within 15 s.
+  Live: repeat Depth:1 **82–90 ms** vs 798 ms first call; a file PUT into the
+  folder is visible on the next listing.
+- **Workers Cache ruled out for good**: only GET/HEAD are cacheable and any
+  request carrying `Authorization` is automatically bypassed — every WebDAV
+  request is Basic-authenticated. The 60 s single-use viewer links make the
+  only cacheable surface ~0% hit rate.
+- **Runtime refreshed** (`5f89195`): `compatibility_date` 2024-12-01 →
+  **2026-07-02** (newest workerd the test pool can execute; the three flags
+  up to Wrangler's 2026-10-01 are Python/dispatchEvent/HTMLRewriter — all
+  unused). `vitest.config.mts` now parses the date out of `wrangler.toml`,
+  so tests can never silently run an older runtime than production. Live
+  deployment confirmed: `Compatibility Date: 2026-07-02`.
+- **Request traces on** (`5f89195`): `[observability.traces]` at 10 %
+  sampling (`head_sampling_rate = 0.1`). Per-request waterfall shows handler
+  time, every TeraBox fetch and DO calls. Free plan includes 0.5 GB/day of
+  observability ingestion and cannot be charged; raise sampling to 1 only
+  while investigating.
+- **Not done, deliberately**: larger upload parts (free-plan 1102 CPU wall —
+  paid-plan decision, `docs/terabox-limits.md`), pacing below 400 ms
+  (anti-ban guard), and raising `/api/list` `num` above 100 (needs a
+  >100-entry live folder to prove the web endpoint honours it).
+
 ## Repo map (context for AI sessions)
 
 Branch state (2026-11-12 — the worker lives in the `tes1ing` account as
