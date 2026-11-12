@@ -6,10 +6,12 @@ after every campaign so future sessions (human or AI) start with context.
 ## Target
 
 - Worker: `https://davbox.tes1ing.workers.dev/` (deploys are **manual**
-  `wrangler deploy` — the dashboard Git integration exists but is not enabled)
+  `wrangler deploy`; no build integration is attached to this worker — see
+  "Repo map")
 - Credentials: WebDAV basic-auth test pair **`test:test`** on the `tes1ing`
-  deployment (the retired `crazy-gooner-mf` free domain still answers with
-  `test:911`; see "Deploy target" below). The pair ships as a default in
+  deployment (the retired `crazy-gooner-mf` free domain is now a Cloudflare
+  404 `error code: 1042`; `test:911` only ever answered there, so a probe
+  aimed at it validates nothing). The pair ships as a default in
   `scripts/live-smoke.sh` / `scripts/live-litmus.sh`. Test-only — it is
   stored in the `USERS` secret, never changes again, and gets deleted
   together with the project when all work is done;
@@ -725,7 +727,11 @@ only existed as code and bclone citations faced its live test — on a *new*
 deployment: the worker now also runs via **Cloudflare Workers Builds** (git
 integration, deploy target `davbox` in the `tes1ing` account,
 `https://davbox.tes1ing.workers.dev/dav/`, credentials `test:test`). Every push
-to `main` now builds and deploys automatically; the `review` gate before push
+to `main` built and deployed automatically **while that integration was
+attached**; as of 2026-11-12 the current worker deploys manually (a push
+produced no build — see "Repo map"), so check
+`npx wrangler deployments list` before assuming a push is live. The
+`review` gate before push
 and the live smoke after still apply. A repo-root `.npmrc`
 (`legacy-peer-deps=true`) was shipped first to make CI's strict
 `npm clean-install` resolve the same tree local sessions have always used
@@ -895,13 +901,24 @@ saved cookie, ever.** Campaign 7's HttpOnly cookie (`davbox_session`,
 
 ## Repo map (context for AI sessions)
 
-Branch state (2026-10-17, post Campaign 8 — premium limits + the free-plan chunk cap; deploy target is `davbox` in the `tes1ing` account via the Workers Builds git integration, hence `https://davbox.tes1ing.workers.dev/dav/` and creds `test:test`):
-production; **deploys now run automatically on every push** via the Workers
-Builds git integration (Campaign 8 superseded the manual `wrangler deploy`
-flow); the `npm run review` gate applies to every push and the live smoke
-to every push and deploy. Current verification: **litmus 138/138** (basic,
-copymove, locks, http, props, protected, lockbomb) + `live-smoke.sh` 34/34 +
-**388 unit tests** (the Campaign 8 pins live inside the same `it`). Latest shipped work:
+Branch state (2026-11-12 — the worker lives in the `tes1ing` account as
+`davbox`, hence `https://davbox.tes1ing.workers.dev/dav/` and creds
+`test:test`; the retired `crazy-gooner-mf` free subdomain now answers a
+Cloudflare 404 `error code: 1042` and no longer reaches the worker):
+production. **Deploys are manual** — `npm run review`, then
+`npx wrangler deploy` from this checkout. The Workers Builds git integration
+recorded after Campaign 8 did not follow the account move: a push on
+2026-11-12 produced no build, and every code deployment in
+`wrangler deployments list` still reads `Source: Upload` / "Automatic
+deployment on upload". Verify the
+mode before relying on either flow (`npx wrangler deployments list`).
+Instance config lives only in the deployer's dashboard and survives deploys
+via `keep_vars = true` (`PATH=/dav/`, `ROOT_ID=/test`,
+`TERABOX_DOMAIN=https://dm.terabox.com`); never add `[vars]` to this public
+repo. The `npm run review` gate applies to every push and the live smoke to
+every push and deploy. Current verification: `live-smoke.sh` 34/34 +
+**444 unit tests** + 11 revert-verified round-17 pins (litmus was last green
+at 138/138 on 2026-10-17). Latest shipped work:
 the Campaign 8 premium-limit campaign — `.npmrc` legacy-peer-deps for CI
 (`85b9082`), tier-aware `MAX_CHUNK_BYTES` chunk cap after the live 1102
 finding (`008a2c3`; begin-with-fix live-verified: >4 GiB begin answers
