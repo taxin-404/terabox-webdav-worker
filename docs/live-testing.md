@@ -5,8 +5,8 @@ after every campaign so future sessions (human or AI) start with context.
 
 ## Target
 
-- Worker: `https://davbox.tes1ing.workers.dev/` (deploys are **manual**
-  `wrangler deploy`; no build integration is attached to this worker — see
+- Worker: `https://davbox.tes1ing.workers.dev/` (every push to `main` is built
+  and deployed automatically by Workers Builds, ~30 s after the push — see
   "Repo map")
 - Credentials: WebDAV basic-auth test pair **`test:test`** on the `tes1ing`
   deployment (the retired `crazy-gooner-mf` free domain is now a Cloudflare
@@ -728,9 +728,8 @@ deployment: the worker now also runs via **Cloudflare Workers Builds** (git
 integration, deploy target `davbox` in the `tes1ing` account,
 `https://davbox.tes1ing.workers.dev/dav/`, credentials `test:test`). Every push
 to `main` built and deployed automatically **while that integration was
-attached**; as of 2026-11-12 the current worker deploys manually (a push
-produced no build — see "Repo map"), so check
-`npx wrangler deployments list` before assuming a push is live. The
+attached** — and still does: every push lands a deployment about 30 s later
+(see "Repo map" for the correlation). The
 `review` gate before push
 and the live smoke after still apply. A repo-root `.npmrc`
 (`legacy-peer-deps=true`) was shipped first to make CI's strict
@@ -905,13 +904,14 @@ Branch state (2026-11-12 — the worker lives in the `tes1ing` account as
 `davbox`, hence `https://davbox.tes1ing.workers.dev/dav/` and creds
 `test:test`; the retired `crazy-gooner-mf` free subdomain now answers a
 Cloudflare 404 `error code: 1042` and no longer reaches the worker):
-production. **Deploys are manual** — `npm run review`, then
-`npx wrangler deploy` from this checkout. The Workers Builds git integration
-recorded after Campaign 8 did not follow the account move: a push on
-2026-11-12 produced no build, and every code deployment in
-`wrangler deployments list` still reads `Source: Upload` / "Automatic
-deployment on upload". Verify the
-mode before relying on either flow (`npx wrangler deployments list`).
+production. **Every push to `main` builds and deploys automatically** via
+Workers Builds — the deployment lands roughly 30 s after the push
+(correlated against `git log`: 2026-10-18 03:36/05:13/06:10/07:19/08:14/09:16
+and 2026-11-12 15:22/15:37 all trail their commit by 26-87 s). Those build
+deployments show up in `wrangler deployments list` as `Source: Upload` /
+"Automatic deployment on upload", exactly like a manual `wrangler deploy`, so
+the list alone cannot tell the two apart — a previous round mis-read that as
+"deploys are manual"; use the timestamp-commit correlation instead.
 Instance config lives only in the deployer's dashboard and survives deploys
 via `keep_vars = true` (`PATH=/dav/`, `ROOT_ID=/test`,
 `TERABOX_DOMAIN=https://dm.terabox.com`); never add `[vars]` to this public
