@@ -52,6 +52,8 @@ export class MockTerabox {
 	private uploads = new Map<string, Map<number, Uint8Array>>();
 	/** filemetas round-trips served — lets tests assert cache behaviour. */
 	filemetasCalls = 0;
+	/** /api/list pages served — pins the directory-listing cache. */
+	listCalls = 0;
 	/** /api/create calls that finalize a chunked upload — pins that racing
 	 *  finalizes reach upstream exactly once. */
 	createCalls = 0;
@@ -326,6 +328,7 @@ export class MockTerabox {
 				return json({ errno: 0 });
 			}
 			if (pathname === '/api/list' && method === 'GET') {
+				this.listCalls++;
 				const dir = url.searchParams.get('dir') || '/';
 				const page = Number(url.searchParams.get('page') || '1');
 				const num = Number(url.searchParams.get('num') || '100');

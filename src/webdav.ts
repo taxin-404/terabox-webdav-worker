@@ -30,6 +30,7 @@ export function resetDavVolatileState(): void {
   metaCache.clear();
   metaMissCache.clear();
   dlUrlCache.clear();
+  listCache.clear();
   metaGenState.value = -1;
   metaGenState.checkedAt = 0;
 }
@@ -608,6 +609,50 @@ async function itemInfoCached(client: TeraboxClient, absPath: string): Promise<T
 }
 
 /**
+ * Read-side directory-listing cache. `/api/list` pages at 100 entries and
+ * every page pays the account-wide pacing floor, so a 500-entry folder costs
+ * 5 upstream calls (~2 s minimum) on *every* PROPFIND Depth:1 — and davfs2
+ * re-lists a directory each time it is opened. Collapsing repeat listings for
+ * a few seconds is the difference between a directory open that waits on
+ * five paced hops and one that does not.
+ *
+ * Staleness is bounded tighter than the item cache (META_TTL_MS is 60 s):
+ * listings are cached for 15 s, and every write through this worker drops the
+ * path, its subtree and its parent immediately, then bumps the shared
+ * generation so other isolates drop theirs within a second. An upload made in
+ * the TeraBox app or web UI still appears within 15 s, which is inside the
+ * envelope the metadata cache already accepts.
+ */
+const LIST_TTL_MS = 15_000;
+/** FIFO caps mirroring metaCache: a long-lived isolate browsing many folders
+ *  cannot pin memory, and one enormous folder is never cached at all. */
+const LIST_MAX_ENTRIES = 32;
+const LIST_MAX_ITEMS = 4000;
+const listCache = new Map<string, { items: TeraboxItem[]; expires: number }>();
+
+function listCacheWrite(absPath: string, items: TeraboxItem[]): void {
+  if (items.length > LIST_MAX_ITEMS) return;
+  const now = Date.now();
+  for (const [key, entry] of listCache) {
+    if (entry.expires <= now) listCache.delete(key);
+  }
+  while (listCache.size >= LIST_MAX_ENTRIES) {
+    const oldest = listCache.keys().next();
+    if (oldest.done) break;
+    listCache.delete(oldest.value);
+  }
+  listCache.set(absPath, { items, expires: now + LIST_TTL_MS });
+}
+
+async function listCached(client: TeraboxClient, absPath: string): Promise<TeraboxItem[]> {
+  const hit = listCache.get(absPath);
+  if (hit && hit.expires > Date.now()) return hit.items;
+  const items = await client.list(absPath === '/' ? '/' : absPath);
+  listCacheWrite(absPath, items);
+  return items;
+}
+
+/**
  * Read-side download-URL cache — the final signed CDN URL from the last
  * successful ladder walk, remembered so repeat GETs (video reopen, player
  * seeks) skip the whole mint chain: no filemetas re-mint, no PCS round-trip,
@@ -706,15 +751,18 @@ async function invalidateMeta(absPath: string, store?: DavStore): Promise<void> 
   metaCache.delete(absPath);
   dlUrlCache.delete(absPath);
   metaMissCache.delete(absPath);
+  listCache.delete(absPath);
   const prefix = absPath.endsWith('/') ? absPath : absPath + '/';
   for (const key of [...metaCache.keys()]) if (key.startsWith(prefix)) metaCache.delete(key);
   for (const key of [...dlUrlCache.keys()]) if (key.startsWith(prefix)) dlUrlCache.delete(key);
   for (const key of [...metaMissCache.keys()]) if (key.startsWith(prefix)) metaMissCache.delete(key);
+  for (const key of [...listCache.keys()]) if (key.startsWith(prefix)) listCache.delete(key);
   const slash = absPath.lastIndexOf('/');
   const parent = slash <= 0 ? '/' : absPath.slice(0, slash);
   metaCache.delete(parent);
   dlUrlCache.delete(parent);
   metaMissCache.delete(parent);
+  listCache.delete(parent);
   if (!store) return;
   try {
     await store.metaGeneration(true);
@@ -748,6 +796,7 @@ async function syncMetaGeneration(store: DavStore): Promise<void> {
       metaCache.clear();
       dlUrlCache.clear();
       metaMissCache.clear();
+      listCache.clear();
     }
     metaGenState.value = gen;
   } catch {
@@ -1877,7 +1926,7 @@ async function handlePropfind(
 
   let children: DavResource[] = [];
   try {
-    const items = await client.list(absPath === '/' ? '/' : absPath);
+    const items = await listCached(client, absPath);
     children = await Promise.all(
       items.map(async (item) => {
         const dent = await itemToDentry(item);
@@ -2122,6 +2171,28 @@ async function handleGet(
       // 200 body.
       range = `bytes=${spec[1]}-${spec[2]}`;
     }
+  }
+
+  // HEAD is a metadata probe: the item already carries the authoritative size,
+  // mtime and ETag, so minting a download link and opening the CDN body only
+  // to cancel it just to echo headers bought nothing. Live measurement on a
+  // 64 KiB file: HEAD 390-780 ms vs 115-184 ms for a ranged GET through the
+  // cached path. Answer from stat, and skip the ladder entirely.
+  if (isHead) {
+    const size = item.size || 0;
+    const spec = range ? /^bytes=(\d*)-(\d*)$/i.exec(range) : null;
+    if (range && spec) {
+      // `spec` is the canonical form rebuilt above, so the arithmetic cannot
+      // disagree with the satisfiability check that already ran.
+      const start = spec[1] === '' ? Math.max(0, size - Number(spec[2])) : Number(spec[1]);
+      const last = spec[1] === '' || spec[2] === '' ? size - 1 : Number(spec[2]);
+      const end = Math.min(last, size - 1);
+      headers.set('Content-Length', String(Math.max(0, end - start + 1)));
+      headers.set('Content-Range', `bytes ${start}-${end}/${size}`);
+      return new Response(null, { status: 206, headers });
+    }
+    headers.set('Content-Length', String(size));
+    return new Response(null, { status: 200, headers });
   }
 
   let lastError: unknown = new TeraboxError(-5, 'No usable download link');

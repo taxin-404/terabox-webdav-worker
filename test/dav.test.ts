@@ -4164,3 +4164,61 @@ describe('round 17 review pins', () => {
 		expect(res.status).toBe(507);
 	});
 });
+
+describe('performance: HEAD and directory listings', () => {
+	const PF_BODY =
+		'<D:propfind xmlns:D="DAV:"><D:prop><D:displayname/></D:prop></D:propfind>';
+	const pfInit = (depth: string): RequestInit => ({
+		method: 'PROPFIND',
+		headers: { Depth: depth, 'Content-Type': 'application/xml' },
+		body: PF_BODY,
+	});
+
+	it('answers HEAD from cached metadata without walking the download ladder', async () => {
+		tb.seed('/head-fast.txt', { content: 'head-fast-path' });
+		const res = await request('/head-fast.txt', { method: 'HEAD' });
+		expect(res.status).toBe(200);
+		expect(res.headers.get('Content-Length')).toBe(String('head-fast-path'.length));
+		expect(res.headers.get('ETag')).toBeTruthy();
+		expect(await res.text()).toBe('');
+		// The pin: a metadata probe must not mint a link or open a CDN body.
+		expect(tb.dlCalls).toBe(0);
+		expect(tb.downloadFidlists).toHaveLength(0);
+	});
+
+	it('answers a ranged HEAD from stat with the exact Content-Range', async () => {
+		tb.seed('/head-range.bin', { content: '0123456789' });
+		const res = await request('/head-range.bin', {
+			method: 'HEAD',
+			headers: { Range: 'bytes=2-5' },
+		});
+		expect(res.status).toBe(206);
+		expect(res.headers.get('Content-Length')).toBe('4');
+		expect(res.headers.get('Content-Range')).toBe('bytes 2-5/10');
+		expect(tb.dlCalls).toBe(0);
+	});
+
+	it('collapses a repeated Depth:1 listing into one upstream page fetch', async () => {
+		tb.seed('/list-cache', { isdir: 1 });
+		tb.seed('/list-cache/one.txt', { content: '1' });
+		const first = await request('/list-cache', pfInit('1'));
+		expect(first.status).toBe(207);
+		expect(tb.listCalls).toBe(1);
+		const second = await request('/list-cache', pfInit('1'));
+		expect(second.status).toBe(207);
+		expect(await second.text()).toContain('one.txt');
+		expect(tb.listCalls).toBe(1);
+	});
+
+	it('drops the cached listing when a write goes through the worker', async () => {
+		tb.seed('/list-inv', { isdir: 1 });
+		expect((await request('/list-inv', pfInit('1'))).status).toBe(207);
+		expect(tb.listCalls).toBe(1);
+		const put = await request('/list-inv/new.txt', { method: 'PUT', body: 'fresh' });
+		expect(put.status).toBe(201);
+		const after = await request('/list-inv', pfInit('1'));
+		expect(after.status).toBe(207);
+		expect(await after.text()).toContain('new.txt');
+		expect(tb.listCalls).toBe(2);
+	});
+});
