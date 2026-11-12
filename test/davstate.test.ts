@@ -547,3 +547,29 @@ describe('round 17 pins: advisory-state byte caps', () => {
 		expect(dst['/dst/f0']!.props).toEqual({});
 	});
 });
+
+describe('member-lock enforcement through the DAV_STATE route', () => {
+	it('refuses a collection DELETE while a member is locked, then accepts its token', async () => {
+		const tag = crypto.randomUUID().slice(0, 8);
+		const coll = `/do-coll-${tag}`;
+		const child = `${coll}/child.txt`;
+		tb.seed(coll, { isdir: 1 });
+		tb.seed(child, { content: 'locked member' });
+		const lock = await request(child, {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(lock.status).toBe(200);
+		const token = lock.headers.get('Lock-Token')!;
+		// subtreeLocks goes through RemoteDavStore → /subtree-locks.
+		expect((await request(coll, { method: 'DELETE' })).status).toBe(423);
+		expect(tb.find(child)).toBeDefined();
+		const ok = await request(coll, {
+			method: 'DELETE',
+			headers: { If: `<${ORIGIN}${child}> (${token})` },
+		});
+		expect(ok.status).toBe(204);
+		expect(tb.find(child)).toBeUndefined();
+	});
+});

@@ -31,6 +31,7 @@ export function resetDavVolatileState(): void {
   metaMissCache.clear();
   dlUrlCache.clear();
   listCache.clear();
+  listEpoch++;
   metaGenState.value = -1;
   metaGenState.checkedAt = 0;
 }
@@ -629,6 +630,16 @@ const LIST_TTL_MS = 15_000;
 const LIST_MAX_ENTRIES = 32;
 const LIST_MAX_ITEMS = 4000;
 const listCache = new Map<string, { items: TeraboxItem[]; expires: number }>();
+/**
+ * Bumped by every event that makes cached listings unsafe: a write through
+ * this worker, a cross-isolate generation change, or a test reset. A listing
+ * walk captures it before the (paced, multi-page) upstream read and refuses
+ * to store a snapshot that resolved after an invalidation — otherwise a list
+ * that started before a write could re-insert pre-write contents and mask
+ * the write for the full TTL, because the generation has already been synced
+ * by the time it lands.
+ */
+let listEpoch = 0;
 
 function listCacheWrite(absPath: string, items: TeraboxItem[]): void {
   if (items.length > LIST_MAX_ITEMS) return;
@@ -647,8 +658,13 @@ function listCacheWrite(absPath: string, items: TeraboxItem[]): void {
 async function listCached(client: TeraboxClient, absPath: string): Promise<TeraboxItem[]> {
   const hit = listCache.get(absPath);
   if (hit && hit.expires > Date.now()) return hit.items;
+  // NOTE: coalescing concurrent walks through a shared promise is NOT safe on
+  // Workers — the promise carries I/O owned by the first request's context and
+  // workerd rejects it from another request ("Cannot perform I/O on behalf of a
+  // different request"). Measured and rejected; each caller walks on its own.
+  const epoch = listEpoch;
   const items = await client.list(absPath === '/' ? '/' : absPath);
-  listCacheWrite(absPath, items);
+  if (epoch === listEpoch) listCacheWrite(absPath, items);
   return items;
 }
 
@@ -752,6 +768,8 @@ async function invalidateMeta(absPath: string, store?: DavStore): Promise<void> 
   dlUrlCache.delete(absPath);
   metaMissCache.delete(absPath);
   listCache.delete(absPath);
+  // Invalidate any list walk that is in flight right now (see listEpoch).
+  listEpoch++;
   const prefix = absPath.endsWith('/') ? absPath : absPath + '/';
   for (const key of [...metaCache.keys()]) if (key.startsWith(prefix)) metaCache.delete(key);
   for (const key of [...dlUrlCache.keys()]) if (key.startsWith(prefix)) dlUrlCache.delete(key);
@@ -797,6 +815,7 @@ async function syncMetaGeneration(store: DavStore): Promise<void> {
       dlUrlCache.clear();
       metaMissCache.clear();
       listCache.clear();
+      listEpoch++;
     }
     metaGenState.value = gen;
   } catch {
@@ -1195,6 +1214,29 @@ async function enforceWrite(
   if (check.applying === 0) return null;
   if (credentials.some((t) => check.recordTokens.includes(t))) return null;
   return errorResponse('Locked', 423);
+}
+
+/**
+ * Collection DELETE/MOVE/overwrite destroys members, so every live lock in
+ * the subtree must be presented — not just locks that cover the collection
+ * itself. RFC 4918 §9.6.1 (DELETE) and §9.9.4 (MOVE) both require it; a
+ * depth-0 lock on `/coll/file` is otherwise invisible to the parent request
+ * and the child disappears without its token. COPY is included for the
+ * Overwrite pre-delete only (copying a locked member is legal; deleting it
+ * is not).
+ */
+async function enforceMemberLocks(
+  request: Request,
+  store: DavStore,
+  path: string,
+  recursive: boolean,
+): Promise<Response | null> {
+  if (!recursive) return null;
+  const presented = presentedCredentials(request.headers.get('If'));
+  const locks = await store.subtreeLocks(path);
+  return locks.some((r) => !presented.includes(r.token))
+    ? errorResponse('Locked', 423)
+    : null;
 }
 
 function activelockXml(rec: LockRecord, href: string): string {
@@ -2153,7 +2195,16 @@ async function handleGet(
       const suffix = Number(spec[2]);
       unsatisfiable = suffix === 0 || size === 0;
     } else {
-      unsatisfiable = Number(spec[1]) >= size;
+      const first = Number(spec[1]);
+      // RFC 9110 §14.1.1: a byte-range-spec whose last position precedes its
+      // first is invalid and the WHOLE header is ignored (200 full entity).
+      // Treating it as satisfiable produced `206 Content-Range: bytes 5-3/10`
+      // from the HEAD fast path and an upstream 416 for GET.
+      if (spec[2] !== '' && Number(spec[2]) < first) {
+        range = null;
+      } else {
+        unsatisfiable = first >= size;
+      }
     }
     if (unsatisfiable) {
       return new Response(null, {
@@ -2164,7 +2215,7 @@ async function handleGet(
         },
       });
     }
-    if (spec) {
+    if (spec && range) {
       // Canonicalize: our parse is case-insensitive, but the origin matches
       // `bytes=` literally when slicing — a satisfied `BYTES=0-2` must ride
       // upstream as `bytes=0-2` or the range silently degrades to a full
@@ -2433,6 +2484,8 @@ async function handleDelete(
   if (!resource) return errorResponse('Not Found', 404);
   const pre = await checkMutationPreconditions(request, client, store, absPath, mount);
   if (pre) return pre;
+  const memberLock = await enforceMemberLocks(request, store, absPath, resource.isDir);
+  if (memberLock) return memberLock;
   await client.fileOperation('delete', [{ path: absPath }]);
   await safeRelocate(store, [{ src: absPath, mode: 'forget', recursive: resource.isDir }]);
   await invalidateMeta(absPath, store);
@@ -2538,11 +2591,23 @@ async function handleMoveCopy(
     enforce: method === 'MOVE',
   });
   if (pre) return pre;
+  // MOVE relocates the whole tree: locked members block it without their
+  // tokens. COPY only reads them, so their locks do not apply.
+  if (method === 'MOVE') {
+    const srcMembers = await enforceMemberLocks(request, store, srcPath, srcResource.isDir);
+    if (srcMembers) return srcMembers;
+  }
 
   const destResource = await statResourceFresh(client, destPath);
   const destLock = await enforceWrite(request, store, destPath);
   if (destLock) return destLock;
   if (destResource && !overwrite) return errorResponse('Precondition Failed', 412);
+  // Overwrite pre-deletes the destination tree (both methods): its locked
+  // members need their tokens even though no `If` names them.
+  if (destResource) {
+    const destMembers = await enforceMemberLocks(request, store, destPath, destResource.isDir);
+    if (destMembers) return destMembers;
+  }
 
   // RFC 4918 §9.9.3: the destination's parent collection must exist (409).
   const parentCheck = await requireParent(client, destPath);

@@ -4222,3 +4222,123 @@ describe('performance: HEAD and directory listings', () => {
 		expect(tb.listCalls).toBe(2);
 	});
 });
+
+describe('range validity and listing races (round 18)', () => {
+	const PF_BODY =
+		'<D:propfind xmlns:D="DAV:"><D:prop><D:displayname/></D:prop></D:propfind>';
+	const pfInit = (depth: string): RequestInit => ({
+		method: 'PROPFIND',
+		headers: { Depth: depth, 'Content-Type': 'application/xml' },
+		body: PF_BODY,
+	});
+
+	it('ignores an inverted range for HEAD and GET (RFC 9110 §14.1.1)', async () => {
+		tb.seed('/inverted.bin', { content: '0123456789' });
+		const head = await request('/inverted.bin', {
+			method: 'HEAD',
+			headers: { Range: 'bytes=5-3' },
+		});
+		expect(head.status).toBe(200);
+		expect(head.headers.get('Content-Length')).toBe('10');
+		expect(head.headers.get('Content-Range')).toBeNull();
+		const get = await request('/inverted.bin', { headers: { Range: 'bytes=5-3' } });
+		expect(get.status).toBe(200);
+		expect(await get.text()).toBe('0123456789');
+	});
+
+	it('does not cache a listing that was in flight when a write landed', async () => {
+		tb.seed('/race-dir', { isdir: 1 });
+		tb.seed('/race-dir/old.txt', { content: 'old' });
+		let release!: () => void;
+		const hold = new Promise<void>((resolve) => (release = resolve));
+		let entered!: () => void;
+		const started = new Promise<void>((resolve) => (entered = resolve));
+		tb.listHold = hold;
+		tb.listHoldStarted = entered;
+		const pending = request('/race-dir', pfInit('1'));
+		await started;
+		expect((await request('/race-dir/new.txt', { method: 'PUT', body: 'fresh' })).status).toBe(201);
+		release();
+		expect((await pending).status).toBe(207);
+		tb.listHold = null;
+		tb.listHoldStarted = null;
+		// The pre-write snapshot must not have been stored: the next listing
+		// walks upstream again and sees the file.
+		const after = await request('/race-dir', pfInit('1'));
+		expect(after.status).toBe(207);
+		expect(await after.text()).toContain('new.txt');
+		expect(tb.listCalls).toBe(2);
+	});
+});
+
+describe('collection mutations honour member locks (RFC 4918 §9.6.1/§9.9.4)', () => {
+	const LOCK_BODY =
+		'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>' +
+		'<D:locktype><D:write/></D:locktype><D:owner><D:href>member-tester</D:href></D:owner></D:lockinfo>';
+
+	async function lockPath(path: string): Promise<string> {
+		const res = await request(path, {
+			method: 'LOCK',
+			headers: { 'Content-Type': 'application/xml' },
+			body: LOCK_BODY,
+		});
+		expect(res.status).toBe(200);
+		return res.headers.get('Lock-Token')!;
+	}
+
+	it('DELETE of a collection requires the token of a locked member', async () => {
+		tb.seed('/lock-coll', { isdir: 1 });
+		tb.seed('/lock-coll/child.txt', { content: 'locked child' });
+		const token = await lockPath('/lock-coll/child.txt');
+		expect((await request('/lock-coll', { method: 'DELETE' })).status).toBe(423);
+		expect(tb.find('/lock-coll/child.txt')).toBeDefined();
+		const ok = await request('/lock-coll', {
+			method: 'DELETE',
+			headers: { If: `<${ORIGIN}/lock-coll/child.txt> (${token})` },
+		});
+		expect(ok.status).toBe(204);
+		expect(tb.find('/lock-coll/child.txt')).toBeUndefined();
+	});
+
+	it('MOVE of a collection requires the token of a locked member', async () => {
+		tb.seed('/lock-src', { isdir: 1 });
+		tb.seed('/lock-src/child.txt', { content: 'locked child' });
+		const token = await lockPath('/lock-src/child.txt');
+		const dest = `${ORIGIN}/lock-moved`;
+		expect(
+			(await request('/lock-src', { method: 'MOVE', headers: { Destination: dest } })).status,
+		).toBe(423);
+		expect(tb.find('/lock-src/child.txt')).toBeDefined();
+		expect(tb.find('/lock-moved/child.txt')).toBeUndefined();
+		const ok = await request('/lock-src', {
+			method: 'MOVE',
+			headers: {
+				Destination: dest,
+				If: `<${ORIGIN}/lock-src/child.txt> (${token})`,
+			},
+		});
+		expect(ok.status).toBe(201);
+		expect(tb.find('/lock-moved/child.txt')).toBeDefined();
+	});
+
+	it('COPY over a collection requires the token of a locked destination member', async () => {
+		tb.seed('/lock-source', { isdir: 1 });
+		tb.seed('/lock-source/a.txt', { content: 'src' });
+		tb.seed('/lock-dest', { isdir: 1 });
+		tb.seed('/lock-dest/child.txt', { content: 'must survive' });
+		const token = await lockPath('/lock-dest/child.txt');
+		const dest = `${ORIGIN}/lock-dest`;
+		expect(
+			(await request('/lock-source', { method: 'COPY', headers: { Destination: dest } })).status,
+		).toBe(423);
+		expect(tb.find('/lock-dest/child.txt')).toBeDefined();
+		const ok = await request('/lock-source', {
+			method: 'COPY',
+			headers: {
+				Destination: dest,
+				If: `<${ORIGIN}/lock-dest/child.txt> (${token})`,
+			},
+		});
+		expect(ok.status).toBe(204);
+	});
+});

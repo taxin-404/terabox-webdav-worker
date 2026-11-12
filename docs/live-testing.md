@@ -940,6 +940,34 @@ body.
   (anti-ban guard), and raising `/api/list` `num` above 100 (needs a
   >100-entry live folder to prove the web endpoint honours it).
 
+### Review round 18 (same day)
+
+Three REAL findings, all fixed with revert-verified pins (454 tests):
+
+1. **Inverted range echoed as 206.** `Range: bytes=5-3` failed the old
+   satisfiability test (it only compared the first position with EOF), so the
+   HEAD fast path emitted `206 Content-Range: bytes 5-3/10` while GET got an
+   upstream 416. Now a last-position-before-first range is invalid and the
+   whole header is ignored (200 full entity), per RFC 9110 §14.1.1.
+2. **A pre-write listing could re-poison the cache.** A Depth:1 walk that
+   started before a PUT could still be running when the write landed (and the
+   generation had already been synced), so it re-inserted pre-write contents
+   for the full 15 s TTL. `listEpoch` is now captured before the paced
+   upstream read and a snapshot that resolves after any invalidation is not
+   stored.
+3. **Collection DELETE/MOVE ignored descendant locks.** Locks were resolved
+   with ancestor coverage only, so a depth-0 lock on `/coll/file` was invisible
+   to `DELETE /coll` (204, locked child destroyed). `subtreeLocks()` (memory +
+   `/subtree-locks` DO route + `RemoteDavStore`) now backs `enforceMemberLocks`
+   on collection DELETE, MOVE source and the Overwrite pre-delete of a
+   destination tree (RFC 4918 §9.6.1/§9.9.4).
+
+Deliberately not done: **cross-request listing coalescing**. A shared promise
+for concurrent Depth:1 walks is not safe on Workers — the promise carries I/O
+owned by the first request's context and workerd fails the second with
+"Cannot perform I/O on behalf of a different request" (reproduced in the test
+pool). Each caller walks independently; the 15 s cache still removes repeats.
+
 ## Repo map (context for AI sessions)
 
 Branch state (2026-11-12 — the worker lives in the `tes1ing` account as

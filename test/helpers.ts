@@ -54,6 +54,11 @@ export class MockTerabox {
 	filemetasCalls = 0;
 	/** /api/list pages served — pins the directory-listing cache. */
 	listCalls = 0;
+	/** When set, `/api/list` waits for this promise before answering — holds a
+	 *  listing walk in flight so a test can land a write in the middle. */
+	listHold: Promise<void> | null = null;
+	/** Called once a held `/api/list` has entered the handler. */
+	listHoldStarted: (() => void) | null = null;
 	/** /api/create calls that finalize a chunked upload — pins that racing
 	 *  finalizes reach upstream exactly once. */
 	createCalls = 0;
@@ -329,6 +334,10 @@ export class MockTerabox {
 			}
 			if (pathname === '/api/list' && method === 'GET') {
 				this.listCalls++;
+				if (this.listHold) {
+					this.listHoldStarted?.();
+					await this.listHold;
+				}
 				const dir = url.searchParams.get('dir') || '/';
 				const page = Number(url.searchParams.get('page') || '1');
 				const num = Number(url.searchParams.get('num') || '100');

@@ -98,6 +98,9 @@ export interface RelocateItem {
 
 export interface DavStore {
   checkTokens(path: string, tokens: string[]): Promise<TokenCheck>;
+  /** Live locks on `path` and every descendant — collection DELETE/MOVE
+   *  must present a token for each (RFC 4918 §9.6.1/§9.9.4). */
+  subtreeLocks(path: string): Promise<LockRecord[]>;
   lockAcquire(path: string, req: LockRequest): Promise<LockOutcome>;
   unlock(path: string, token: string): Promise<UnlockOutcome>;
   describe(paths: string[]): Promise<Record<string, PathState>>;
@@ -367,6 +370,23 @@ function applyingLocksOf(locks: Map<string, LockRecord[]>, path: string): LockRe
       if (rec.expiresAt <= now) continue;
       if (lockCovers(lockedPath, rec, path)) out.push(rec);
     }
+  }
+  return out;
+}
+
+/**
+ * Live locks at `path` and anywhere beneath it. A collection DELETE/MOVE
+ * destroys members too, and RFC 4918 §9.6.1/§9.9.4 require a token for every
+ * locked resource in the affected tree — the ancestor-only `applyingLocksOf`
+ * cannot see a depth-0 lock on a child.
+ */
+function coreSubtreeLocks(locks: Map<string, LockRecord[]>, path: string): LockRecord[] {
+  const now = Date.now();
+  const prefix = path === '/' ? '/' : path + '/';
+  const out: LockRecord[] = [];
+  for (const [lockedPath, records] of locks) {
+    if (lockedPath !== path && !lockedPath.startsWith(prefix)) continue;
+    for (const rec of records) if (rec.expiresAt > now) out.push(rec);
   }
   return out;
 }
@@ -693,6 +713,10 @@ export class MemoryDavStore implements DavStore, UploadStore {
     return coreCheckTokens(this.locks, path, tokens, true);
   }
 
+  async subtreeLocks(path: string): Promise<LockRecord[]> {
+    return coreSubtreeLocks(this.locks, path);
+  }
+
   async lockAcquire(path: string, req: LockRequest): Promise<LockOutcome> {
     return coreLockAcquire(this.locks, path, req, true);
   }
@@ -821,6 +845,10 @@ export class RemoteDavStore implements DavStore, UploadStore {
 
   checkTokens(path: string, tokens: string[]): Promise<TokenCheck> {
     return this.call<TokenCheck>('/tokens', { path, tokens });
+  }
+
+  subtreeLocks(path: string): Promise<LockRecord[]> {
+    return this.call<LockRecord[]>('/subtree-locks', { path });
   }
 
   lockAcquire(path: string, req: LockRequest): Promise<LockOutcome> {
@@ -1035,6 +1063,9 @@ export class DavState extends DurableObject {
             false,
           );
           return Response.json(out);
+        }
+        case '/subtree-locks': {
+          return Response.json(coreSubtreeLocks(this.locks, body['path'] as string));
         }
         case '/lock': {
           const snap = this.advisorySnapshot();
