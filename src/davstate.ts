@@ -698,12 +698,21 @@ export class MemoryDavStore implements DavStore, UploadStore {
   private props = new Map<string, Record<string, string>>();
   private uploads = new Map<string, UploadSession>();
   private metaGen = 0;
+  /** Test hook: how many generation bumps this store has published. */
+  private genBumps = 0;
 
   /** Test hook: clear per-isolate advisory state between test cases. */
   reset(): void {
     this.locks.clear();
     this.props.clear();
     this.uploads.clear();
+    this.metaGen = 0;
+    this.genBumps = 0;
+  }
+
+  /** Test hook: bump count, to pin "one generation per mutation". */
+  bumpCount(): number {
+    return this.genBumps;
   }
 
   async checkTokens(path: string, tokens: string[]): Promise<TokenCheck> {
@@ -771,7 +780,10 @@ export class MemoryDavStore implements DavStore, UploadStore {
   }
 
   async metaGeneration(bump: boolean): Promise<number> {
-    if (bump) this.metaGen += 1;
+    if (bump) {
+      this.metaGen += 1;
+      this.genBumps += 1;
+    }
     return this.metaGen;
   }
 
@@ -813,6 +825,11 @@ const sharedMemoryStore = new MemoryDavStore();
 /** Test hook: clear per-isolate advisory state between test cases. */
 export function resetDavVolatileState(): void {
   sharedMemoryStore.reset();
+}
+
+/** Test hook: generation bumps published by the shared memory store. */
+export function memoryBumpCountForTest(): number {
+  return sharedMemoryStore.bumpCount();
 }
 
 /** Pick the store: Durable Object when bound, per-isolate memory otherwise. */

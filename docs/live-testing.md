@@ -968,6 +968,19 @@ owned by the first request's context and workerd fails the second with
 "Cannot perform I/O on behalf of a different request" (reproduced in the test
 pool). Each caller walks independently; the 15 s cache still removes repeats.
 
+Two low-risk wins from the same review, both pinned:
+
+- **One generation bump per MOVE/COPY.** A MOVE-with-overwrite used to publish
+  three generation changes (destination pre-delete, source, destination), each
+  a serialized DO write; readers clear wholesale, so the intermediate bumps
+  buy nothing. `invalidateMeta(..., bump = false)` now suppresses all but the
+  last. Saves 1–2 DO writes on every overwriting move — DO row writes are the
+  metered free-tier resource (see quota discipline in AGENTS.md).
+- **Generation sync only where a cache is read.** The per-request cross-isolate
+  freshness check moved below the resumable routes and skips `OPTIONS`, so a
+  4 GiB upload (~1025 chunk PUTs) no longer pays a DO read per second for data
+  it never consults. Reads (GET/HEAD/PROPFIND) still reconcile as before.
+
 ## Repo map (context for AI sessions)
 
 Branch state (2026-11-12 — the worker lives in the `tes1ing` account as

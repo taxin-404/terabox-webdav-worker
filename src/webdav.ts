@@ -763,7 +763,11 @@ function dlUrlCacheTouch(absPath: string): void {
  * Advisory: the metadata is already correct on Terabox when this runs, so a
  * failed bump must never fail the write.
  */
-async function invalidateMeta(absPath: string, store?: DavStore): Promise<void> {
+async function invalidateMeta(
+  absPath: string,
+  store?: DavStore,
+  bump = true,
+): Promise<void> {
   metaCache.delete(absPath);
   dlUrlCache.delete(absPath);
   metaMissCache.delete(absPath);
@@ -781,7 +785,11 @@ async function invalidateMeta(absPath: string, store?: DavStore): Promise<void> 
   dlUrlCache.delete(parent);
   metaMissCache.delete(parent);
   listCache.delete(parent);
-  if (!store) return;
+  // `bump = false` lets a multi-path mutation (MOVE/COPY touches source,
+  // destination and a pre-deleted target) publish one generation instead of
+  // one serialized DO write per path. Every isolate clears wholesale on any
+  // change, so a single bump after the operation is equivalent.
+  if (!store || !bump) return;
   try {
     await store.metaGeneration(true);
   } catch (error) {
@@ -791,6 +799,10 @@ async function invalidateMeta(absPath: string, store?: DavStore): Promise<void> 
 
 /** Last shared generation this isolate reconciled against. */
 const metaGenState = { value: -1, checkedAt: 0 };
+/** Test hook: when the generation was last checked (0 = never). */
+export function metaGenCheckedAtForTest(): number {
+  return metaGenState.checkedAt;
+}
 /** Reconciliation cadence: one Durable Object read per second per isolate is
  *  enough to keep stale size/etag/dlink off the response path (the previous
  *  design served them for the full 60 s TTL in any isolate but the writer's)
@@ -1492,8 +1504,6 @@ export async function handleWebDav(
   // isolates Cloudflare runs. Advisory: the memory fallback has no apiSlot,
   // and pace() keeps its isolate-local floor either way.
   client.apiSlotReserver = store.apiSlot ? (minGapMs) => store.apiSlot!(minGapMs) : undefined;
-  // Cross-isolate freshness: drop anything another isolate invalidated.
-  await syncMetaGeneration(store);
 
   // Base path (gdrive parity): the surface only exists below `mount.base`.
   // The bare base redirects to its slash form; anything else outside 404s.
@@ -1574,6 +1584,12 @@ export async function handleWebDav(
   if (method !== 'OPTIONS' && isReservedDavSegment(upstreamDavPath)) {
     return errorResponse('Forbidden', 403);
   }
+
+  // Cross-isolate freshness: drop anything another isolate invalidated. Kept
+  // below the resumable routes and after OPTIONS, which never read a cache —
+  // a 4 GiB upload is ~1025 chunk PUTs and each one would otherwise pay a DO
+  // read per second for data it never consults (SPEC: generation sync).
+  if (method !== 'OPTIONS') await syncMetaGeneration(store);
 
   switch (method) {
     case 'OPTIONS':
@@ -2621,7 +2637,8 @@ async function handleMoveCopy(
     // node is recoverable from the recycle bin, never destroyed.
     await client.fileOperation('delete', [{ path: destPath }]);
     await safeRelocate(store, [{ src: destPath, mode: 'forget', recursive: destResource.isDir }]);
-    await invalidateMeta(destPath, store);
+    // One generation bump for the whole MOVE/COPY is enough (see invalidateMeta).
+    await invalidateMeta(destPath, store, false);
   }
 
   const recursive = srcResource.isDir;
@@ -2655,7 +2672,7 @@ async function handleMoveCopy(
     },
   ]);
 
-  await invalidateMeta(srcPath, store);
+  await invalidateMeta(srcPath, store, false);
   await invalidateMeta(destPath, store);
   return new Response(null, { status: destResource && overwrite ? 204 : 201 });
 }

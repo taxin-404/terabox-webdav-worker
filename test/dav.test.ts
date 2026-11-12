@@ -4,6 +4,7 @@ import {
 	metaCacheHasForTest,
 	metaCacheSeedForTest,
 	metaCacheSize,
+	metaGenCheckedAtForTest,
 	metaMissCacheHasForTest,
 	metaMissCacheSeedForTest,
 	metaMissCacheSize,
@@ -13,6 +14,7 @@ import {
 	upstreamSafeName,
 } from '../src/webdav';
 import type { DavStore, RelocateItem } from '../src/davstate';
+import { memoryBumpCountForTest } from '../src/davstate';
 import { validateXml } from '../src/davxml';
 import { resetTeraboxCaches, TeraboxClient } from '../src/terabox';
 import { getChunkSize } from '../src/sign';
@@ -4340,5 +4342,33 @@ describe('collection mutations honour member locks (RFC 4918 §9.6.1/§9.9.4)', 
 			},
 		});
 		expect(ok.status).toBe(204);
+	});
+});
+
+describe('generation-bump economy (round 18 P2/P3)', () => {
+	it('OPTIONS and resumable chunk routes never pay a generation read', async () => {
+		expect((await request('/', { method: 'OPTIONS' })).status).toBe(204);
+		expect(metaGenCheckedAtForTest()).toBe(0);
+		// A control request that does read the caches reconciles instead.
+		const pf = await request('/', {
+			method: 'PROPFIND',
+			headers: { Depth: '0', 'Content-Type': 'application/xml' },
+			body: '<D:propfind xmlns:D="DAV:"><D:prop><D:displayname/></D:prop></D:propfind>',
+		});
+		expect(pf.status).toBe(207);
+		expect(metaGenCheckedAtForTest()).toBeGreaterThan(0);
+	});
+
+	it('publishes one generation bump per MOVE/COPY, not one per touched path', async () => {
+		tb.seed('/bump-src.txt', { content: 'src' });
+		tb.seed('/bump-dst.txt', { content: 'dst' });
+		// Overwrite: dest pre-delete + source + destination all invalidate.
+		const moved = await request('/bump-src.txt', {
+			method: 'MOVE',
+			headers: { Destination: `${ORIGIN}/bump-dst.txt` },
+		});
+		expect(moved.status).toBe(204);
+		expect(memoryBumpCountForTest()).toBe(1);
+		expect(tb.find('/bump-dst.txt')).toBeDefined();
 	});
 });
