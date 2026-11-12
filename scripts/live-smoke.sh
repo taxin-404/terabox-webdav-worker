@@ -30,6 +30,21 @@ curl -s -u "$A" "$B$COL/f.txt" -o "$TMP/g.txt"
 ok "GET content byte-exact" "$(cmp -s "$TMP/p.txt" "$TMP/g.txt" && echo same || echo diff)" same
 ok "Range GET bytes=2-9 -> 206" "$(code -u "$A" -H 'Range: bytes=2-9' "$B$COL/f.txt")" 206
 
+echo "== HEAD fast path =="
+ok "HEAD -> 200" "$(code -I -u "$A" "$B$COL/f.txt")" 200
+ok "HEAD content-length" "$(curl -s -I -u "$A" "$B$COL/f.txt" | tr -d '\r ' | grep -i '^content-length:' | cut -d: -f2)" "$(wc -c < "$TMP/p.txt" | tr -d ' ')"
+ok "HEAD Range bytes=2-9 -> 206" "$(code -I -u "$A" -H 'Range: bytes=2-9' "$B$COL/f.txt")" 206
+ok "HEAD Range content-range" "$(curl -s -I -u "$A" -H 'Range: bytes=2-9' "$B$COL/f.txt" | tr -d '\r ' | grep -i '^content-range:' | cut -d: -f2- | tr -d ' ')" "bytes2-9/$(wc -c < "$TMP/p.txt")"
+ok "HEAD unsatisfiable -> 416" "$(code -I -u "$A" -H 'Range: bytes=9999-' "$B$COL/f.txt")" 416
+ETAG=$(curl -s -I -u "$A" "$B$COL/f.txt" | tr -d '\r ' | grep -i '^etag:' | cut -d: -f2-)
+ok "HEAD label f.txt readable" "$([ -n "$ETAG" ] && echo yes || echo no)" yes
+ok "HEAD If-None-Match -> 304" "$(code -I -u "$A" -H "If-None-Match: $ETAG" "$B$COL/f.txt")" 304
+
+echo "== listing cache freshness =="
+code -X PROPFIND -H 'Depth: 1' -u "$A" "$B$COL" >/dev/null
+ok "PUT after cached listing -> 201" "$(code -X PUT -u "$A" --data fresh "$B$COL/after-cache.txt")" 201
+ok "listing sees fresh write" "$(curl -s -u "$A" -X PROPFIND -H 'Depth: 1' "$B$COL" | grep -c 'after-cache.txt')" 1
+
 echo "== dead props =="
 PP='<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><X:s xmlns:X="urn:smoke">v</X:s></D:prop></D:set></D:propertyupdate>'
 ok "PROPPATCH set -> 207" "$(code -X PROPPATCH -u "$A" -H 'Content-Type: application/xml' --data "$PP" "$B$COL/f.txt")" 207
