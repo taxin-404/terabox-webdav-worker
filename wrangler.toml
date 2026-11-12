@@ -1,6 +1,18 @@
 name = "davbox"
 main = "src/index.ts"
-compatibility_date = "2024-12-01"
+# Newest runtime date the test toolchain can execute (workerd 2026-06-25 in
+# @cloudflare/vitest-pool-workers). Bumped from 2024-12-01 after auditing
+# every flag this date enables against the code: no Node/Python/container/
+# Workers-Assets/WebSocket/Queue surface is used; streams are only passed
+# through as `response.body` (no TransformStream or writer use); outbound
+# fetches never carry `Authorization` (so cross-origin redirect stripping is
+# inert); request bodies are BufferSource, not iterables. The three flags
+# between this date and Wrangler's newest (2026-10-01) are Python-only,
+# `dispatchEvent()` exception handling and `HTMLRewriter` ESI — none used.
+# The suite runs this exact date (vitest.config.mts reads this line), so a
+# runtime regression fails `npm run review` instead of production. Raising
+# it further requires a newer vitest-pool-workers first.
+compatibility_date = "2026-07-02"
 workers_dev = true
 preview_urls = true
 
@@ -21,6 +33,15 @@ keep_vars = true
 
 [observability]
 enabled = true
+
+# Visual traces per request (waterfall of handler → Durable Object → TeraBox
+# fetches) with no code changes. Beta, free-plan included, and sampling is
+# set to a fraction because a WebDAV client can issue many requests per
+# action; 0.1 still samples enough to diagnose a slow mount without filling
+# the dashboard. Raise to 1 while actively investigating a report.
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.1
 
 # NO [vars] in this file — every environment value is user-made in the
 # deployer's dashboard (preserved by `keep_vars = true` above):

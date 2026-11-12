@@ -1,10 +1,17 @@
 import { defineConfig } from 'vitest/config';
+import { readFileSync } from 'node:fs';
 import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
 
-// Match wrangler.toml's compatibility_date so tests exercise the same
-// runtime semantics as production deploys.
+// Tests must exercise the same runtime semantics as production deploys, so
+// the date is read from wrangler.toml rather than duplicated (the pair had
+// been pinned to a 22-month-old runtime). A malformed/absent value throws
+// here — the suite can never silently test an older runtime than the one
+// deployed.
+const wranglerToml = readFileSync(new URL('./wrangler.toml', import.meta.url), 'utf8');
+const dateMatch = /^\s*compatibility_date\s*=\s*"([^"]+)"\s*$/m.exec(wranglerToml);
+if (!dateMatch) throw new Error('wrangler.toml is missing compatibility_date');
 const compat = {
-	compatibilityDate: '2024-12-01',
+	compatibilityDate: dateMatch[1]!,
 };
 
 const davBindings = {

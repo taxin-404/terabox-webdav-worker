@@ -472,12 +472,21 @@ per-request, but not shared across isolates. The Worker keeps serving.
   second in every client), and requests carrying `If-Match`/`If-None-Match`
   always see live validators.
 
+## Observability
+
+Logs and request traces are enabled in `wrangler.toml`. Open the Worker in
+the dashboard → **Observability** → **Traces** for a per-request waterfall:
+handler time, every TeraBox fetch, and Durable Object calls. Traces sample
+10% of requests (`head_sampling_rate = 0.1`) — raise it to `1` temporarily
+when chasing a slow mount, then put it back. Logs are collected
+automatically (Free plan: 200k events/day, 3-day retention).
+
 ## Development
 
 ```sh
 npm install --legacy-peer-deps   # wrangler pins + sharp override
 npm run typecheck                # tsc --noEmit
-npm test                         # Vitest: 428 cases over a mocked TeraBox API
+npm test                         # Vitest: 448 cases over a mocked TeraBox API
 npm run review                   # typecheck + tests + dry-run deploy (no upload)
 npm run dev                      # local wrangler dev server (http://localhost:8787)
 npm run deploy                   # wrangler deploy (push to production)
